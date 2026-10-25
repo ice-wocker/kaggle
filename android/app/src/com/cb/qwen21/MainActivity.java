@@ -40,6 +40,13 @@ public class MainActivity extends Activity {
     /** 内置 seed（与 Kaggle 端一致），种子不落盘也不上网络 */
     private static final String SEED = "qwen21unc2026";
 
+    /** 出图参数的默认值：与 docs/run_summary.json 那次实测完全一致，装上就能复现。 */
+    static final String D_PROMPT = "一只穿西装的猫，赛博朋克城市夜景，电影感打光，85mm 浅景深";
+    static final int D_STEPS = 20;
+    static final int D_SIZE = 1024;
+    static final double D_CFG = 1.0;
+    static final long D_SEED = 20261025L;
+
     private final ExecutorService pool = Executors.newFixedThreadPool(3);
     private final Handler ui = new Handler(Looper.getMainLooper());
     private final AtomicBoolean cancelled = new AtomicBoolean(false);
@@ -109,10 +116,10 @@ public class MainActivity extends Activity {
         TextView tip = Ui.label(this, "Key 只存在本机，仅发给 kaggle.com 与你自己启动的那台 GPU。"
                 + "首次约 10-15 分钟（装环境 + 下 17GB INT8 权重），之后每次开 App 秒连。", 11, Ui.MUTED);
         Ui.add(conn, tip, 6);
-        etUser = Ui.input(this, "Kaggle 用户名（用 KGAT_ 开头的新 Key 时可留空）",
+        etUser = Ui.input(this, "Kaggle 用户名（新版 KGAT_ 令牌可留空，自动探测）",
                 sp.getString("user", ""), false);
         Ui.add(conn, etUser, 10);
-        etKey = Ui.input(this, "Kaggle API Key（KAGGLE_KEY / KGAT_…）", sp.getString("key", ""), false);
+        etKey = Ui.input(this, "粘 KGAT_… 令牌（或旧版 KAGGLE_KEY）", sp.getString("key", ""), false);
         Ui.add(conn, etKey, 8);
         btnKeyMode = btn("Key 形式：" + KEY_LABELS[keyMode]);
         btnKeyMode.setOnClickListener(v -> pickKeyMode());
@@ -124,7 +131,8 @@ public class MainActivity extends Activity {
         // 任务面板
         LinearLayout task = Ui.panel(this);
         task.addView(Ui.card(this, "② 输入任务"));
-        etPrompt = Ui.input(this, "想要什么图？一句中文也行", sp.getString("prompt", ""), true);
+        etPrompt = Ui.input(this, "想要什么图？一句中文也行",
+                sp.getString("prompt", D_PROMPT), true);
         Ui.add(task, etPrompt, 10);
 
         // 风格 + NSFW + 自动补词
@@ -163,9 +171,9 @@ public class MainActivity extends Activity {
 
         LinearLayout nums = new LinearLayout(this);
         nums.setOrientation(LinearLayout.HORIZONTAL);
-        etSteps = Ui.input(this, "步数", sp.getString("steps", "20"), true);
-        etW = Ui.input(this, "宽", sp.getString("w", "1024"), true);
-        etH = Ui.input(this, "高", sp.getString("h", "1024"), true);
+        etSteps = Ui.input(this, "步数", sp.getString("steps", String.valueOf(D_STEPS)), true);
+        etW = Ui.input(this, "宽", sp.getString("w", String.valueOf(D_SIZE)), true);
+        etH = Ui.input(this, "高", sp.getString("h", String.valueOf(D_SIZE)), true);
         LinearLayout.LayoutParams np = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
         np.rightMargin = Ui.dp(this, 8);
         nums.addView(wrapField("步数", etSteps), np);
@@ -175,8 +183,8 @@ public class MainActivity extends Activity {
 
         LinearLayout nums2 = new LinearLayout(this);
         nums2.setOrientation(LinearLayout.HORIZONTAL);
-        etCfg = Ui.input(this, "cfg", sp.getString("cfg", "1.0"), true);
-        etSeed = Ui.input(this, "种子(-1 随机)", sp.getString("seed", "-1"), true);
+        etCfg = Ui.input(this, "cfg", sp.getString("cfg", String.valueOf(D_CFG)), true);
+        etSeed = Ui.input(this, "种子(-1 随机)", sp.getString("seed", String.valueOf(D_SEED)), true);
         LinearLayout.LayoutParams np2 = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
         np2.rightMargin = Ui.dp(this, 8);
         nums2.addView(wrapField("CFG", etCfg), np2);
@@ -382,7 +390,13 @@ public class MainActivity extends Activity {
     }
 
     private void saveKeyFields() {
-        sp.edit().putString("key", etKey.getText().toString().trim())
+        String k = Kaggle.normalizeKey(etKey.getText().toString());
+        // 顺手把粘进来的 export 行、网页噪声洗掉，回填给人看得见的干净值
+        if (!k.isEmpty() && !k.equals(etKey.getText().toString().trim())) {
+            etKey.setText(k);
+            etKey.setSelection(k.length());
+        }
+        sp.edit().putString("key", k)
                 .putString("user", etUser.getText().toString().trim()).apply();
     }
 
@@ -404,12 +418,14 @@ public class MainActivity extends Activity {
                     return;
                 }
             } catch (Exception e) {
-                log("旧地址失效，重新拉起云端");
+                log("旧地址失效，重新拉起云端（能连上就不用管 Key）");
             }
         }
-        final String key = etKey.getText().toString().trim();
+        final String key = Kaggle.normalizeKey(etKey.getText().toString());
         final String usr = etUser.getText().toString().trim();
-        if (key.isEmpty()) throw new IllegalStateException("先填 Kaggle API Key");
+        if (key.isEmpty()) throw new IllegalStateException("先填 Kaggle API Key（KGAT_ 开头那个令牌，粘 export 整行也行）");
+        if (!Kaggle.complete(usr, key))
+            throw new IllegalStateException("这是旧式 KAGGLE_KEY，还得补上 Kaggle 用户名；新版 KGAT_ 令牌不用填");
         final String effUser = usr.isEmpty() ? "me" : usr;
         ui.post(() -> setStatus("拉起云端…", 0xFFE0B341));
         Kaggle.Progress p = new Kaggle.Progress() {
@@ -501,8 +517,11 @@ public class MainActivity extends Activity {
                 afterSubmit(tid, a, env);
 
             } catch (Api.AuthError e) {
-                setStatus("Key 无效", 0xFFE05B5B);
-                log("出错: API Key / 令牌不对，换一个再试");
+                setStatus("鉴权没过", 0xFFE05B5B);
+                // Kaggle 那句 "Key 无效" 太笼统：设备令牌、账号归属、云端令牌都可能
+                log("出错: " + (e.getMessage() == null ? "鉴权没过" : e.getMessage()));
+                if (e.getMessage() != null && e.getMessage().contains("Kaggle"))
+                    log("  提示: 新版页面只给一个 KGAT_ 令牌，账号由它自己认，用户名可以留空");
                 resetBtn();
             } catch (Exception e) {
                 setStatus("失败", 0xFFE05B5B);
@@ -624,18 +643,15 @@ public class MainActivity extends Activity {
     protected void onResume() {
         super.onResume();
         // 后台静默预热：已经有可用地址就不打扰用户，直接用
-        if (!etKey.getText().toString().trim().isEmpty()) {
+        if (!Kaggle.normalizeKey(etKey.getText().toString()).isEmpty()) {
             pool.execute(() -> {
                 String base = sp.getString("url", "");
                 if (base.isEmpty()) return;
-                try {
-                    JSONObject h = Kaggle.probe(base, sp.getString("token", ""));
-                    if (h.optBoolean("ok") && h.optBoolean("auth", true))
-                        ui.post(() -> {
-                            tvCloud.setText("云端在线 · " + base.replace("https://", ""));
-                            setStatus("在线", Ui.ACCENT);
-                        });
-                } catch (Exception ignore) {}
+                if (Kaggle.alive(base, sp.getString("token", "")))
+                    ui.post(() -> {
+                        tvCloud.setText("云端在线 · " + base.replace("https://", ""));
+                        setStatus("在线", Ui.ACCENT);
+                    });
             });
         }
     }

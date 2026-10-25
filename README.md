@@ -62,6 +62,10 @@ QWEN21://<base64url({"kind":"ready","url":"https://xxxx.trycloudflare.com","toke
 
 **装好只需要填一个 Kaggle API Key。** 没有云端地址，没有口令，没有 push 命令，没有构建脚本。
 
+新版 Kaggle 设置页只给一个 `KGAT_…` 令牌：粘进去就行，用户名留空、由 `hello` 自己认出账号；
+连 `export KAGGLE_API_TOKEN=…` 整行、`echo … > ~/.kaggle/access_token` 整行贴进去也能认。
+旧式 32 位 key 才需要额外填用户名——以前不管哪种都要求两个字段，是这个报错的根。
+
 点一次「一键出图」，手机自己干这些事：
 
 1. `hello` 探出 Key 属于哪个账号（不用你填用户名）
