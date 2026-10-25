@@ -116,7 +116,7 @@ public class MainActivity extends Activity {
         TextView tip = Ui.label(this, "Key 只存在本机，仅发给 kaggle.com 与你自己启动的那台 GPU。"
                 + "首次约 10-15 分钟（装环境 + 下 17GB INT8 权重），之后每次开 App 秒连。", 11, Ui.MUTED);
         Ui.add(conn, tip, 6);
-        etUser = Ui.input(this, "Kaggle 用户名（新版 KGAT_ 令牌可留空，自动探测）",
+        etUser = Ui.input(this, "Kaggle 用户名（可留空；填就填 kaggle.com/ 后那个 handle，不是昵称）",
                 sp.getString("user", ""), false);
         Ui.add(conn, etUser, 10);
         etKey = Ui.input(this, "粘 KGAT_… 令牌（或旧版 KAGGLE_KEY）", sp.getString("key", ""), false);
@@ -424,8 +424,8 @@ public class MainActivity extends Activity {
         final String key = Kaggle.normalizeKey(etKey.getText().toString());
         final String usr = etUser.getText().toString().trim();
         if (key.isEmpty()) throw new IllegalStateException("先填 Kaggle API Key（KGAT_ 开头那个令牌，粘 export 整行也行）");
-        if (!Kaggle.complete(usr, key))
-            throw new IllegalStateException("这是旧式 KAGGLE_KEY，还得补上 Kaggle 用户名；新版 KGAT_ 令牌不用填");
+        // 只拦真正空的：用户名留不留空由 Kaggle 判断，不由我们替它先否掉一个填对了的人
+        log("Key " + Kaggle.localHint(key));
         final String effUser = usr.isEmpty() ? "me" : usr;
         ui.post(() -> setStatus("拉起云端…", 0xFFE0B341));
         Kaggle.Progress p = new Kaggle.Progress() {
@@ -521,7 +521,8 @@ public class MainActivity extends Activity {
                 // Kaggle 那句 "Key 无效" 太笼统：设备令牌、账号归属、云端令牌都可能
                 log("出错: " + (e.getMessage() == null ? "鉴权没过" : e.getMessage()));
                 if (e.getMessage() != null && e.getMessage().contains("Kaggle"))
-                    log("  提示: 新版页面只给一个 KGAT_ 令牌，账号由它自己认，用户名可以留空");
+                    log("  提示: a) 新版页面只给一个 KGAT_ 令牌，用户名留空即可"
+                            + " b) 用户名别填成昵称，必须是 kaggle.com/后面那个 handle");
                 resetBtn();
             } catch (Exception e) {
                 setStatus("失败", 0xFFE05B5B);

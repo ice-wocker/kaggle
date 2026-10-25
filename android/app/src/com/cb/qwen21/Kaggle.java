@@ -39,6 +39,11 @@ final class Kaggle {
         this.key = normalizeKey(key);
     }
 
+    /** 用户名是 optString 出来的，null 就是 ""，不会真有 "null" 这种账号。 */
+    private static boolean blank(String s) {
+        return s == null || s.trim().isEmpty() || "null".equals(s);
+    }
+
     // ---------------- HTTP ----------------
 
     private static final class Res {
@@ -55,6 +60,8 @@ final class Kaggle {
         c.setConnectTimeout(20000);
         c.setReadTimeout(60000);
         c.setInstanceFollowRedirects(true);
+        // 用户名还没探出来就先只发 key，Basic 的账号位留空：Kaggle 按 key 认人。
+        // 别在这里拿 "me" 当账号发上去——hello 自己都不认这个名字。
         c.setRequestProperty("Authorization", "Basic " + Auth.b64(user + ":" + key));
         c.setRequestProperty("User-Agent", "Qwen21APK/2.0");
         return c;
@@ -98,48 +105,60 @@ final class Kaggle {
         // export KAGGLE_API_TOKEN=KGAT_xxx / KAGGLE_KEY=xxx 这类整行；用户名不算凭据，不能抓错
         java.util.regex.Matcher kv = Pattern.compile("(?i)KAGGLE_(?:API_)?(?:TOKEN|KEY)\\s*=\\s*(\\S+)").matcher(s);
         if (kv.find()) s = kv.group(1);
-        // 一整行 URL / 完整网页都贴进来的，取最长的那段合法字符
-        java.util.regex.Matcher tok = Pattern.compile("[A-Za-z0-9_\\-]{16,}").matcher(s);
+        // 一整行 URL / 完整网页都贴进来的，取最长的那段合法字符。
+        // 但 KGAT_ 令牌里带下划线，必须整段连着切，不能拆散前缀。
+        java.util.regex.Matcher tok = Pattern.compile("(?i)KGAT_[A-Za-z0-9_\\-]{8,}|[A-Za-z0-9_\\-]{16,}").matcher(s);
         String best = "";
         while (tok.find()) if (tok.group().length() > best.length()) best = tok.group();
         return best.isEmpty() ? s : best;
     }
 
-    /** 单个字段就能开工：KGAT_ 自带身份，旧式 key 靠用户名配对。 */
-    static boolean complete(String user, String key) {
-        String k = normalizeKey(key);
-        if (k.isEmpty()) return false;
-        return isToken(k) || !(user == null || user.trim().isEmpty());
-    }
-
-    /** hello 会回 token 与 userName，两个都拿，谁先到用谁。 */
+    /** hello 会回 token 与 userName，两个都拿，谁先到用谁。它说的错话不算数，见 probeOwner。 */
     JSONObject whoami() throws Exception {
         Res r = json(HOST + "/api/v1/hello", "GET", null);
-        if (r.code == 401 || r.code == 403) throw new Api.AuthError("API Key 无效或无权限");
+        if (r.code == 401 || r.code == 403) throw new Api.AuthError("hello 不认这个 Key（HTTP " + r.code + "）");
         if (r.code >= 400) throw new Api.KaggleException("hello HTTP " + r.code);
         return r.json();
     }
 
-    /** 真实账号名：Key 属于谁，内核就推到谁名下。省掉一个要用户手填的字段。 */
-    String resolveUser() throws Exception {
-        JSONObject o = whoami();
-        String u = o.optString("userName", "");
-        if (u.isEmpty()) u = o.optString("username", "");
-        if (!u.isEmpty()) return u;
-        // hello 不认这个 Key 的形态时，退回用户自己填的（旧式 KAGGLE_KEY 场景）
-        if (!user.isEmpty() && !"me".equals(user)) return user;
-        throw new Api.AuthError("认不出这个 Key 属于哪个账号，请补填 Kaggle 用户名");
+    /**
+     * hello 只是个探测点，不是判官。
+     *
+     * 它曾经把格式完全正确的 Key 判成 401，于是整条链路在第一步就死了——
+     * 用户手上的东西没错，错的是我们太信这一句。现在这里只回答"探到没有"，
+     * 401/403/404 一律当成"探不到"，绝不再据此对人说 Key 无效。
+     */
+    String probeOwner() {
+        try {
+            JSONObject o = whoami();
+            String u = o.optString("userName", "");
+            if (blank(u)) u = o.optString("username", "");
+            if (blank(u)) u = o.optString("user", "");
+            return blank(u) ? "" : u.trim();
+        } catch (Exception e) {
+            return "";
+        }
     }
 
-    boolean checkKey() {
-        try {
-            resolveUser();
-            return true;
-        } catch (Api.AuthError e) {
-            return false;
-        } catch (Exception e) {
-            return true; // 网络问题不算 Key 错
-        }
+    /** 真实账号名：Key 属于谁，内核就推到谁名下。省掉一个要用户手填的字段。 */
+    String resolveUser() throws Exception {
+        String u = probeOwner();
+        if (!blank(u)) return u;
+        // 探不到就信用户：填了就用，没填就用 Kaggle 自己的 me
+        if (!blank(user) && !"me".equals(user)) return user;
+        return "me";
+    }
+
+    /**
+     * 本地体检，不联网、不下判断：只回答"这一格看起来像不像凭据"。
+     * 真伪交给 Kaggle，我们不再抢着说"你填错了"。
+     */
+    static String localHint(String raw) {
+        String k = normalizeKey(raw);
+        if (k.isEmpty()) return "还没填 Key";
+        if (isToken(k)) return "看起来像一个 KGAT_ 令牌";
+        if (k.length() == 32) return "看起来像旧式 32 位 key（用户名可留空）";
+        return "长度 " + k.length() + "，既不像 KGAT_ 令牌也不像 32 位 key——先按原样试，不行再回 Kaggle 设置页核对";
     }
 
     // ---------------- 起活 ----------------
@@ -175,7 +194,8 @@ final class Kaggle {
         payload.put("isRetry", false);
         Res r = json(HOST + "/api/v1/kernels/push", "POST", payload);
         if (r.code == 401 || r.code == 403)
-            throw new Api.AuthError("推内核被拒（HTTP " + r.code + "）：Key 没权限或已失效");
+            throw new Api.AuthError("推内核被拒（HTTP " + r.code + "）：Key 没权限、已失效，或账号 " + owner
+                    + " 不对（用户名可留空，留空就用 Kaggle 的 me）");
         if (r.code >= 400)
             throw new Api.KaggleException("push 失败 HTTP " + r.code + ": " + shortBody(r.text()) + hint(r.text()));
         return r.text();
@@ -200,7 +220,8 @@ final class Kaggle {
         Res r = json(HOST + "/api/v1/kernels/status/" + enc(owner + "/" + SLUG), "GET", null);
         if (r.code == 404) return new KernelState();
         if (r.code == 401 || r.code == 403)
-            throw new Api.AuthError("查内核状态被拒（HTTP " + r.code + "）：Key 与账号 " + owner + " 不匹配");
+            throw new Api.AuthError("查内核状态被拒（HTTP " + r.code + "）：Key 与账号 " + owner
+                    + " 不匹配——多半是用户名填错了，留空即可");
         if (r.code >= 400) throw new Api.KaggleException("status HTTP " + r.code);
         JSONObject o = r.json();
         KernelState k = new KernelState();
@@ -331,7 +352,8 @@ final class Kaggle {
     Map<String, String> bringUp(String apiKey, Progress p, long timeoutMs) throws Exception {
         long t0 = System.currentTimeMillis();
         String owner = resolveUser();
-        p.stage("账号 " + owner);
+        // hello 探不出名字时 owner 是 me：照样往下走，别在门口把人拦住
+        p.stage("me".equals(owner) ? "账号按 Key 自动识别" : "账号 " + owner);
 
         p.stage("检查云端会话");
         KernelState cur = status(owner);
