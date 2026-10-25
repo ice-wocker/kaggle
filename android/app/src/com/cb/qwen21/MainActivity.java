@@ -39,9 +39,13 @@ public class MainActivity extends Activity {
 
     /** 内置 seed（与 Kaggle 端一致），种子不落盘也不上网络 */
     private static final String SEED = "qwen21unc2026";
-    private static final String DEF_UNET = "qwen-image-2.1-UC-int8_convrot.safetensors";
-    private static final String DEF_CLIP = "qwen3vl_8b_int8_convrot.safetensors";
-    private static final String DEF_VAE = "qwen_image_2.1_vae_bf16.safetensors";
+
+    /** 出图参数的默认值：与 docs/run_summary.json 那次实测完全一致，装上就能复现。 */
+    static final String D_PROMPT = "一只穿西装的猫，赛博朋克城市夜景，电影感打光，85mm 浅景深";
+    static final int D_STEPS = 20;
+    static final int D_SIZE = 1024;
+    static final double D_CFG = 1.0;
+    static final long D_SEED = 20261025L;
 
     private final ExecutorService pool = Executors.newFixedThreadPool(3);
     private final Handler ui = new Handler(Looper.getMainLooper());
@@ -49,8 +53,12 @@ public class MainActivity extends Activity {
     private final List<Bitmap> results = new ArrayList<>();
 
     private SharedPreferences sp;
-    private EditText etUrl, etToken, etPrompt, etNeg, etSteps, etW, etH, etCfg, etSeed;
-    private TextView tvStatus, tvLog, tvTaskHex, tvPromptPreview;
+    private EditText etPrompt, etNeg, etSteps, etW, etH, etCfg, etSeed;
+    private static final String[] KEY_LABELS = {"KAGGLE_KEY（账号=用户名）", "KGAT_（账号由接口探测）"};
+    private EditText etKey, etUser;
+    private Button btnKeyMode;
+    private int keyMode = 0;
+    private TextView tvStatus, tvLog, tvTaskHex, tvPromptPreview, tvCloud;
     private LinearLayout gallery, statusDot;
     private ImageView preview;
     private Button btnRun, btnStyle, btnSave, btnBatch;
@@ -58,11 +66,16 @@ public class MainActivity extends Activity {
     private android.widget.CompoundButton swNsfw, swQuality;
     private String styleName = "自动";
     private byte[] lastPng;
+    /** 当前请求打到的是云端（ComfyUI）还是 Kaggle：两者都回 401，但原因完全不同。 */
+    private final java.util.concurrent.atomic.AtomicBoolean isCloudStep =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
 
     @Override
     protected void onCreate(Bundle b) {
         super.onCreate(b);
         sp = getSharedPreferences("qwen21", MODE_PRIVATE);
+        // 从旧版升级上来的：地址/口令已无用，Key 还没填过就直接弹配置
+        if (!sp.getBoolean("offline", false)) sp.edit().putBoolean("offline", true).apply();
         batch = Math.max(1, Math.min(4, sp.getInt("batch", 1)));
         setContentView(buildUi());
         renderTasks();
@@ -100,32 +113,29 @@ public class MainActivity extends Activity {
         Ui.add(head, sub, 4);
         Ui.add(root, head, 0);
 
-        // 连接面板
+        // ① 只需一个 Key
         LinearLayout conn = Ui.panel(this);
-        conn.addView(Ui.card(this, "① 云端连接"));
-        etUrl = Ui.input(this, "https://xxxx.trycloudflare.com", sp.getString("url", ""), false);
-        Ui.add(conn, etUrl, 10);
-        etToken = Ui.input(this, "访问令牌（可选，与云端约定的口令）", sp.getString("token", ""), false);
-        Ui.add(conn, etToken, 8);
-        LinearLayout connBtns = new LinearLayout(this);
-        connBtns.setOrientation(LinearLayout.HORIZONTAL);
-        Button bTest = btn("测试连接");
-        bTest.setOnClickListener(v -> testConn());
-        Button bSave = btn("保存并连接");
-        bSave.setOnClickListener(v -> {
-            sp.edit().putString("url", etUrl.getText().toString().trim())
-                    .putString("token", etToken.getText().toString().trim()).apply();
-            testConn();
-        });
-        connBtns.addView(bTest, weight(1));
-        connBtns.addView(bSave, weight(1));
-        Ui.add(conn, connBtns, 10);
+        conn.addView(Ui.card(this, "① 一个 Key，剩下全自动"));
+        TextView tip = Ui.label(this, "Key 只存在本机，仅发给 kaggle.com 与你自己启动的那台 GPU。"
+                + "首次约 10-15 分钟（装环境 + 下 17GB INT8 权重），之后每次开 App 秒连。", 11, Ui.MUTED);
+        Ui.add(conn, tip, 6);
+        etUser = Ui.input(this, "Kaggle 用户名（可留空；填就填 kaggle.com/ 后那个 handle，不是昵称）",
+                sp.getString("user", ""), false);
+        Ui.add(conn, etUser, 10);
+        etKey = Ui.input(this, "粘 KGAT_… 令牌（或旧版 KAGGLE_KEY）", sp.getString("key", ""), false);
+        Ui.add(conn, etKey, 8);
+        btnKeyMode = btn("Key 形式：" + KEY_LABELS[keyMode]);
+        btnKeyMode.setOnClickListener(v -> pickKeyMode());
+        Ui.add(conn, btnKeyMode, 8);
+        tvCloud = Ui.label(this, "云端未启动", 12, Ui.MUTED);
+        Ui.add(conn, tvCloud, 10);
         Ui.add(root, conn, 14);
 
         // 任务面板
         LinearLayout task = Ui.panel(this);
         task.addView(Ui.card(this, "② 输入任务"));
-        etPrompt = Ui.input(this, "想要什么图？一句中文也行", sp.getString("prompt", ""), true);
+        etPrompt = Ui.input(this, "想要什么图？一句中文也行",
+                sp.getString("prompt", D_PROMPT), true);
         Ui.add(task, etPrompt, 10);
 
         // 风格 + NSFW + 自动补词
@@ -164,9 +174,9 @@ public class MainActivity extends Activity {
 
         LinearLayout nums = new LinearLayout(this);
         nums.setOrientation(LinearLayout.HORIZONTAL);
-        etSteps = Ui.input(this, "步数", sp.getString("steps", "20"), true);
-        etW = Ui.input(this, "宽", sp.getString("w", "1024"), true);
-        etH = Ui.input(this, "高", sp.getString("h", "1024"), true);
+        etSteps = Ui.input(this, "步数", sp.getString("steps", String.valueOf(D_STEPS)), true);
+        etW = Ui.input(this, "宽", sp.getString("w", String.valueOf(D_SIZE)), true);
+        etH = Ui.input(this, "高", sp.getString("h", String.valueOf(D_SIZE)), true);
         LinearLayout.LayoutParams np = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
         np.rightMargin = Ui.dp(this, 8);
         nums.addView(wrapField("步数", etSteps), np);
@@ -176,8 +186,8 @@ public class MainActivity extends Activity {
 
         LinearLayout nums2 = new LinearLayout(this);
         nums2.setOrientation(LinearLayout.HORIZONTAL);
-        etCfg = Ui.input(this, "cfg", sp.getString("cfg", "1.0"), true);
-        etSeed = Ui.input(this, "种子(-1 随机)", sp.getString("seed", "-1"), true);
+        etCfg = Ui.input(this, "cfg", sp.getString("cfg", String.valueOf(D_CFG)), true);
+        etSeed = Ui.input(this, "种子(-1 随机)", sp.getString("seed", String.valueOf(D_SEED)), true);
         LinearLayout.LayoutParams np2 = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
         np2.rightMargin = Ui.dp(this, 8);
         nums2.addView(wrapField("CFG", etCfg), np2);
@@ -197,7 +207,7 @@ public class MainActivity extends Activity {
         });
 
         btnRun = new Button(this);
-        btnRun.setText("一键生成");
+        btnRun.setText("一键出图");
         btnRun.setTextSize(17);
         btnRun.setTextColor(0xFF07100E);
         btnRun.setAllCaps(false);
@@ -360,48 +370,118 @@ public class MainActivity extends Activity {
     }
 
     private Api api() {
-        String u = etUrl.getText().toString().trim();
-        if (u.isEmpty()) u = sp.getString("url", "");
-        if (u.isEmpty()) throw new IllegalStateException("先填云端地址");
-        return new Api(u, etToken.getText().toString().trim());
+        // 云端地址由 Kaggle.java 自己拿到并缓存在 sp 里；这里只负责取用
+        return apiCached();
     }
 
-    private void testConn() {
-        final String url = etUrl.getText().toString().trim();
-        setStatus("连接中…", 0xFFE0B341);
-        pool.execute(() -> {
+    private Api apiCached() {
+        String u = sp.getString("url", "");
+        if (u.isEmpty()) throw new IllegalStateException("云端还没起，点「一键出图」会自动启动");
+        return new Api(u, sp.getString("token", ""));
+    }
+
+    private void pickKeyMode() {
+        new AlertDialog.Builder(this)
+                .setTitle("Key 形式")
+                .setSingleChoiceItems(KEY_LABELS, keyMode, (d, i) -> {
+                    keyMode = i;
+                    btnKeyMode.setText("Key 形式：" + KEY_LABELS[i]);
+                    etUser.setHint(i == 1 ? "可留空，自动探测" : "Kaggle 用户名");
+                    d.dismiss();
+                })
+                .show();
+    }
+
+    private void saveKeyFields() {
+        String k = Kaggle.normalizeKey(etKey.getText().toString());
+        // 顺手把粘进来的 export 行、网页噪声洗掉，回填给人看得见的干净值
+        if (!k.isEmpty() && !k.equals(etKey.getText().toString().trim())) {
+            etKey.setText(k);
+            etKey.setSelection(k.length());
+        }
+        sp.edit().putString("key", k)
+                .putString("user", etUser.getText().toString().trim()).apply();
+    }
+
+    /**
+     * 全链路：Key -> 起/复用 GPU 会话 -> 等地址下发 -> 探活。
+     * 云端已经在线时这一步几乎瞬时，所以每次出图前都跑一遍也没成本。
+     */
+    private void ensureCloud() throws Exception {
+        ensureCloud(false);
+    }
+
+    /**
+     * @param force 上次出图被云端 401 挡下时置真：不信本地缓存的地址与令牌，
+     *              重新走一遍「读日志拿地址」的握手。Key 本身没问题，别把它也一起否了。
+     */
+    private void ensureCloud(boolean force) throws Exception {
+        String base = force ? "" : sp.getString("url", "");
+        String token = sp.getString("token", "");
+        if (force) log("上次被云端挡下，清掉缓存地址重新握手");
+        if (!base.isEmpty()) {
             try {
-                Api a = new Api(url, etToken.getText().toString().trim());
-                String s = a.stats();
-                JSONObject o = new JSONObject(s);
-                String dev = "?";
-                try {
-                    JSONArray d = o.getJSONArray("devices");
-                    if (d.length() > 0) dev = d.getJSONObject(0).optString("name", "?");
-                } catch (Exception ignore) {}
-                log("连接成功 · " + dev);
-                setStatus("在线", Ui.ACCENT);
-                String objectInfo = a.get("/object_info/EncryptText");
-                JSONObject oi = new JSONObject(objectInfo);
-                if (!oi.has("EncryptText")) log("警告：云端缺少加密节点 EncryptText");
-                else log("加密节点已就绪");
+                // 缓存里的令牌可能是旧会话的：让 handshake 校准，别为了过期令牌去惊动 Kaggle
+                final String good = Kaggle.handshake(base, token);
+                if (!good.equals(token)) {
+                    log("令牌已按云端现时的校准，不用重填 Key");
+                    sp.edit().putString("token", good).apply();
+                }
+                ui.post(() -> {
+                    tvCloud.setText("云端在线 · " + base.replace("https://", ""));
+                    setStatus("在线", Ui.ACCENT);
+                });
+                return;
             } catch (Exception e) {
-                setStatus("失败", 0xFFE05B5B);
-                log("连接失败: " + e.getMessage());
+                log("旧地址失效，重新拉起云端（能连上就不用管 Key）");
             }
+        }
+        final String key = Kaggle.normalizeKey(etKey.getText().toString());
+        final String usr = etUser.getText().toString().trim();
+        if (key.isEmpty()) throw new IllegalStateException("先填 Kaggle API Key（KGAT_ 开头那个令牌，粘 export 整行也行）");
+        // 只拦真正空的：用户名留不留空由 Kaggle 判断，不由我们替它先否掉一个填对了的人
+        log("Key " + Kaggle.localHint(key));
+        final String effUser = usr.isEmpty() ? "me" : usr;
+        ui.post(() -> setStatus("拉起云端…", 0xFFE0B341));
+        Kaggle.Progress p = new Kaggle.Progress() {
+            @Override public void stage(String st) {
+                ui.post(() -> {
+                    tvCloud.setText(st);
+                    tvStatus.setText(st);
+                });
+                log("云 · " + st);
+            }
+            @Override public void detail(String d) {
+                ui.post(() -> tvCloud.setText(d));
+            }
+            @Override public boolean cancelled() { return cancelled.get(); }
+        };
+        java.util.Map<String, String> got = new Kaggle(effUser, key).bringUp(key, p, 20 * 60 * 1000L);
+        final String url = got.get("url"), tok = got.get("token");
+        sp.edit().putString("url", url).putString("token", tok)
+                .putString("owner", got.get("owner")).putString("egress", got.get("egress")).apply();
+        ui.post(() -> {
+            tvCloud.setText("云端在线 · " + url.replace("https://", ""));
+            setStatus("在线", Ui.ACCENT);
         });
+        log("云 · 地址已下发 " + url);
     }
 
     private void generate() {
+        generate(false);
+    }
+
+    private void generate(boolean rehandshake) {
         cancelled.set(false);
         btnRun.setEnabled(false);
-        btnRun.setText("生成中…");
+        btnRun.setText("准备中…");
         final String rawPrompt = etPrompt.getText().toString().trim();
         if (rawPrompt.isEmpty()) {
             toastLog("任务为空");
             resetBtn();
             return;
         }
+        saveKeyFields();
         sp.edit().putString("prompt", rawPrompt)
                 .putString("steps", etSteps.getText().toString())
                 .putString("w", etW.getText().toString())
@@ -410,8 +490,7 @@ public class MainActivity extends Activity {
                 .putString("seed", etSeed.getText().toString())
                 .putString("neg", etNeg.getText().toString())
                 .putBoolean("nsfw", swNsfw.isChecked())
-                .putBoolean("quality", swQuality.isChecked())
-                .putString("url", etUrl.getText().toString().trim()).apply();
+                .putBoolean("quality", swQuality.isChecked()).apply();
 
         final int steps = parseInt(etSteps.getText().toString(), 20);
         final int w = align(parseInt(etW.getText().toString(), 1024));
@@ -424,44 +503,64 @@ public class MainActivity extends Activity {
         String negRaw = etNeg.getText().toString().trim();
         if (negRaw.isEmpty()) negRaw = nsfw ? Presets.nsfwNegative() : "";
         final String neg = nsfw ? Presets.stripCensor(negRaw) : negRaw;
+        final long useSeed = seed >= 0 ? seed : Math.abs(new java.util.Random().nextLong() % 1_000_000_000L);
 
-        setStatus("提交中…", 0xFFE0B341);
+        setStatus("准备中…", 0xFFE0B341);
         log("— 新任务 —");
 
         pool.execute(() -> {
             try {
+                // 1) 云端：Key 换地址，已经在线就秒过
+                isCloudStep.set(false);
+                ensureCloud(rehandshake);
                 Api a = api();
-                // 1) 本地加密：明文不上网络
-                byte[] blob = Crypto.encodeTask(prompt, key());
-                String hexHead = Crypto.hex(blob).substring(0, 32);
-                log("① 本地加密完成 " + blob.length + "B · " + hexHead + "…");
+                isCloudStep.set(true);
 
-                // 2) 让云端加密节点留档一份密文（ComfyUI 原生节点）
-                try {
-                    JSONObject enc = new JSONObject();
-                    enc.put("class_type", "EncryptText");
-                    JSONObject ei = new JSONObject();
-                    ei.put("text", prompt);
-                    ei.put("seed", SEED);
-                    ei.put("label", "1");
-                    enc.put("inputs", ei);
-                    JSONObject wf = new JSONObject();
-                    wf.put("90", enc);
-                    String pid = a.submit(wf);
-                    log("② 云端加密留档 prompt_id=" + pid.substring(0, 8));
-                } catch (Exception e) {
-                    log("② 云端留档跳过: " + e.getMessage());
-                }
-
-                // 3) 提交出图任务
-                long useSeed = seed >= 0 ? seed : Math.abs(new java.util.Random().nextLong() % 1_000_000_000L);
-                log("正向词 " + prompt.length() + " 字 · 负面词 " + (neg.isEmpty() ? "无" : neg.length() + " 字"));
+                // 2) 端上封一个信封：提示词 + 全部参数一起加密，明文不出设备
+                java.util.LinkedHashMap<String, Object> f = new java.util.LinkedHashMap<>();
+                f.put("prompt", prompt);
+                f.put("negative", neg);
+                f.put("steps", steps);
+                f.put("cfg", cfg);
+                f.put("seed", useSeed);
+                f.put("batch", batch);
+                f.put("width", w);
+                f.put("height", h);
+                f.put("nsfw", nsfw);
+                byte[] env = Crypto.packTask(f, key());
+                log("① 本地封装 " + env.length + "B · " + Crypto.hex(env).substring(0, 32) + "…");
                 log("参数 " + w + "x" + h + " · " + steps + " 步 · cfg " + cfg + " · seed " + useSeed
                         + (nsfw ? " · NSFW 开" : ""));
-                JSONObject wf = Workflow.build(prompt, neg, w, h, steps, useSeed, cfg, batch,
-                        "euler", "simple", DEF_UNET, DEF_CLIP, DEF_VAE, "apk");
-                afterSubmit(a.submit(wf), a, blob);
 
+                // 3) 加密提交
+                String tid = a.submitSealed(env);
+                log("② 已入队 " + tid.substring(0, 8));
+                afterSubmit(tid, a, env);
+
+            } catch (Api.AuthError e) {
+                String msg = e.getMessage() == null ? "401" : e.getMessage();
+                boolean fromCloud = msg.contains("/qwen/") || msg.contains("unauthorized")
+                        || isCloudStep.get();
+                log("出错: " + msg);
+                if (fromCloud) {
+                    setStatus("云端 401", 0xFFE05B5B);
+                    log("  云端不认这个令牌，跟你的 Kaggle Key 无关");
+                    if (!rehandshake && !cancelled.get()) {
+                        log("  自动重来一次：先校准令牌，不行再丢掉旧地址重新握手");
+                        resetBtn();
+                        new android.os.Handler(android.os.Looper.getMainLooper())
+                                .postDelayed(() -> generate(true), 1200);
+                    } else {
+                        log("  诊断: 云端会话可能刚交班，稍等几分钟再点一次；仍不行就把上面这行发我");
+                        resetBtn();
+                    }
+                } else {
+                    setStatus("Kaggle 拒绝", 0xFFE05B5B);
+                    String tip = Kaggle.explain(etKey.getText().toString(),
+                            etUser.getText().toString(), msg);
+                    if (!tip.isEmpty()) log("  诊断: " + tip);
+                    resetBtn();
+                }
             } catch (Exception e) {
                 setStatus("失败", 0xFFE05B5B);
                 log("出错: " + e.getMessage());
@@ -470,23 +569,31 @@ public class MainActivity extends Activity {
         });
     }
 
-    private void afterSubmit(String pid, Api a, byte[] blob) throws Exception {
-        ui.post(() -> setStatus("生成中…", 0xFFE0B341));
-        log("③ 已入队 " + pid.substring(0, 8) + "，等待 GPU…");
-        JSONObject hist = a.wait(pid, 900_000, new Api.Progress() {
-            public void tick(long sec) {
-                final long s = sec;
-                ui.post(() -> {
-                    setStatus("生成中 " + s + "s", 0xFFE0B341);
-                    btnRun.setText("生成中 " + s + "s");
-                });
-            }
-            public boolean cancelled() { return cancelled.get(); }
+    private void afterSubmit(String tid, Api a, byte[] env) throws Exception {
+        ui.post(() -> {
+            setStatus("生成中…", 0xFFE0B341);
+            btnRun.setText("生成中…");
         });
+        log("③ 等待 GPU（T4 上 1024×1024/20 步约 4 分钟）");
+        long t0 = System.currentTimeMillis();
+        JSONObject st = null;
+        while (true) {
+            if (cancelled.get()) throw new InterruptedException("已取消");
+            st = a.task(tid);
+            String state = st.optString("state");
+            if ("done".equals(state)) break;
+            if ("error".equals(state)) throw new IllegalStateException("云端报错: " + st.optString("detail"));
+            long sec = (System.currentTimeMillis() - t0) / 1000;
+            final long fs = sec;
+            ui.post(() -> {
+                setStatus("生成中 " + fs + "s", 0xFFE0B341);
+                btnRun.setText("生成中 " + fs + "s");
+            });
+            Thread.sleep(2000);
+        }
 
-        // 4) 取回图片 -> 端上解密回原文，验证加密链路闭环
-        JSONArray imgs = Api.images(hist);
-        if (imgs.length() == 0) throw new IllegalStateException("没有返回图片");
+        JSONArray imgs = st.optJSONArray("images");
+        if (imgs == null || imgs.length() == 0) throw new IllegalStateException("没有返回图片");
         java.util.List<Bitmap> got = new ArrayList<>();
         byte[] firstPng = null;
         for (int i = 0; i < imgs.length(); i++) {
@@ -500,9 +607,8 @@ public class MainActivity extends Activity {
         }
         if (got.isEmpty()) throw new IllegalStateException("图片解码失败");
         final byte[] png = firstPng;
-        String echo = Crypto.decodeTask(blob, key());
-        log("④ 出图成功 " + got.size() + " 张 " + got.get(0).getWidth() + "x" + got.get(0).getHeight()
-                + " · 本地解密校验: " + echo);
+        log("④ 出图 " + got.size() + " 张 " + got.get(0).getWidth() + "x" + got.get(0).getHeight()
+                + " · 用时 " + st.optDouble("elapsed", 0) + "s · 信封 " + env.length + "B（全程未明文过网）");
         ui.post(() -> {
             for (int i = got.size() - 1; i >= 0; i--) results.add(0, got.get(i));
             lastPng = png;
@@ -532,7 +638,7 @@ public class MainActivity extends Activity {
     private void resetBtn() {
         ui.post(() -> {
             btnRun.setEnabled(true);
-            btnRun.setText("一键生成");
+            btnRun.setText("一键出图");
         });
     }
 
@@ -569,6 +675,23 @@ public class MainActivity extends Activity {
     private static int align(int v) {
         int c = Math.max(256, Math.min(2048, v));
         return (c / 64) * 64;
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        // 后台静默预热：已经有可用地址就不打扰用户，直接用
+        if (!Kaggle.normalizeKey(etKey.getText().toString()).isEmpty()) {
+            pool.execute(() -> {
+                String base = sp.getString("url", "");
+                if (base.isEmpty()) return;
+                if (Kaggle.alive(base, sp.getString("token", "")))
+                    ui.post(() -> {
+                        tvCloud.setText("云端在线 · " + base.replace("https://", ""));
+                        setStatus("在线", Ui.ACCENT);
+                    });
+            });
+        }
     }
 
     @Override

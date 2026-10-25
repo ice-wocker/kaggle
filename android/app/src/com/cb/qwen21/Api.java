@@ -49,12 +49,20 @@ final class Api {
         return bo.toByteArray();
     }
 
+    /** 401 的响应体有时候是 cloudflared 的错误页，带上前 80 字符能一眼分出是谁挡的。 */
+    private static String brief(String body) {
+        String b = body == null ? "" : body.replaceAll("\\s+", " ").trim();
+        if (b.isEmpty()) return "";
+        return b.length() <= 80 ? b : b.substring(0, 80) + "…";
+    }
+
     String get(String path) throws Exception {
         HttpURLConnection c = open(path, "GET");
         int code = c.getResponseCode();
         InputStream in = code >= 400 ? c.getErrorStream() : c.getInputStream();
         String body = in == null ? "" : readAll(in);
         c.disconnect();
+        if (code == 401 || code == 403) throw new AuthError("HTTP " + code + " " + brief(body));
         if (code >= 400) throw new ApiException(code, body);
         return body;
     }
@@ -68,6 +76,7 @@ final class Api {
         InputStream in = code >= 400 ? c.getErrorStream() : c.getInputStream();
         String s = in == null ? "" : readAll(in);
         c.disconnect();
+        if (code == 401 || code == 403) throw new AuthError("HTTP " + code + " " + brief(s));
         if (code >= 400) throw new ApiException(code, s);
         return s;
     }
@@ -140,9 +149,38 @@ final class Api {
         return out;
     }
 
+    /**
+     * 提交加密任务。整个信封（提示词 + 参数）在端上封好，明文不出设备，
+     * 云端只负责解封和执行。返回任务 id。
+     */
+    String submitSealed(byte[] envelope) throws Exception {
+        JSONObject req = new JSONObject();
+        req.put("t", android.util.Base64.encodeToString(envelope, android.util.Base64.NO_WRAP));
+        // 信封里没有任何凭据字段，鉴权只能走请求头
+        req.put("k", token == null ? "" : token);
+        String body = postJson("/qwen/generate", req);
+        JSONObject o = new JSONObject(body);
+        if (o.has("error")) throw new IllegalStateException(o.getString("error"));
+        return o.getString("id");
+    }
+
+    JSONObject task(String id) throws Exception {
+        return new JSONObject(get("/qwen/task/" + enc(id)));
+    }
+
     interface Progress {
         void tick(long sec) throws Exception;
         boolean cancelled();
+    }
+
+    /** 凭据不对：需要重新拿 Key / 令牌，重试没有意义。 */
+    static final class AuthError extends Exception {
+        AuthError(String m) { super(m); }
+    }
+
+    /** Kaggle 侧的业务失败（push 被拒、内核报错、等待超时）。 */
+    static final class KaggleException extends Exception {
+        KaggleException(String m) { super(m); }
     }
 
     static final class ApiException extends Exception {
