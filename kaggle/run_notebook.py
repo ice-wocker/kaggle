@@ -29,6 +29,7 @@ def stage(name):
     print(f"\n===== [{name}] =====", flush=True)
     publish("stage", name)
     mark(name)
+    stage_report()   # 控制台（笔记本里那个页面 + App 内 WebView）同步看到走到了哪一步
 
 
 try:
@@ -84,6 +85,10 @@ try:
     stage("serve")
     url = start_tunnel(8188)
     print(f"\n>>> APK 无需任何配置，地址与令牌已随日志下发：{url}", flush=True)
+    # 笔记本里直接把这个地址开出来：App 内嵌的是同一个页面，
+    # 于是「笔记本上的界面」和「应用内的界面」看的是同一份数据、同一秒刷新。
+    print(f"\n>>> 实时控制台（笔记本）：{url}/qwen/console?token={make_token(SEED)}", flush=True)
+    print(f">>> 同一页面已内嵌进 App 的「终端」，两边同步", flush=True)
 
     # 手机是后来才连上来的，前面那些 stage 行它一条都没见过。
     # 补一版现状，让人一打开 App 就看到"到哪一步了"，不用猜。

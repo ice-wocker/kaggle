@@ -7,7 +7,41 @@ Kaggle 免费 GPU 跑 `Qwen-Image-2.1-Uncensored` 的 **INT8** 量化版，Andro
 *T4 上 20 步 1024×1024，236 秒。上面的图就是 `docs/run_summary.json` 里那次运行的产物。*
 
 这是**一张**的数。要看 9 张、要看这个数落在一个什么区间里，用 `kaggle/gen_batch.py`
-（见[下一节](#9-张一起跑)），它把单张墙钟记进 `docs/bench/batch.json`。
+（见[下面](#9-张一起跑)），它把单张墙钟记进 `docs/bench/batch.json`。
+
+## 终端
+
+APK 现在是一台终端：**输 Key 直接进创建界面**，点「开始生成」当场翻到终端页，
+第几步、百分比、每个阶段、日志、过程图一起滚。笔记本和手机看的是**同一个页面**
+（云端 `/qwen/console`），所以两边天然同步——不是两个界面各自猜，是同一份数据画两次。
+
+```
+填 Key ──▶ 创建（参数 + 信封体长）──▶ 终端（阶段 / 步数 / 过程图 / 日志）
+                                          │
+                          笔记本里开同一个 URL ┘
+```
+
+云端为此多开了四个口，都带令牌：
+
+| 口 | 给谁看 | 回什么 |
+| --- | --- | --- |
+| `/qwen/console` | 人 | 控制台页面本身（不含任何秘密） |
+| `/qwen/console.json` | 页面 / 手机 | 阶段线、队列、进度、最近日志 |
+| `/qwen/steps/{id}` | 手机 | 第几步 / 共几步 / 百分比 / 已用时 |
+| `/qwen/preview/{id}` | 手机 | KSampler 当前 latent 的缩略图 |
+| `/qwen/decrypt` | 手机 | 信封字段名与长度（**不给值**） |
+
+换页面不用重建 APK：终端页是个 WebView，指向云端那个页面；URL 每次从本地缓存的
+隧道地址现取，会话交班换了域名也自己跟上。
+
+![控制台](docs/device/console-page.png)
+
+*这一步是第 7 步。图是噪点——它就是噪点，采样中间态本来长这样。*
+
+浏览器里渲染的是页面，数据是我拿一份假快照喂的（真跑一次要 T4 和 4 分钟）。
+上面这张是 `docs/device/console-page.png`，用真 Chromium 打开 `/qwen/console` 拍的，
+进度条 35%、六枚阶段芯片、过程图、日志四行都在位。
+
 
 ## 目录
 
@@ -72,7 +106,7 @@ QWEN21://<base64url({"kind":"ready","url":"https://xxxx.trycloudflare.com","toke
 
 ## APK（已编译，直接装）
 
-安装包在仓库里：**[`apk/qwen-image-2.1-oneclick.apk`](apk/qwen-image-2.1-oneclick.apk)**（1.4 / versionCode 5，100 KB，minSdk 24，v2+v3 双方案签名）。
+安装包在仓库里：**[`apk/qwen-image-2.1-oneclick.apk`](apk/qwen-image-2.1-oneclick.apk)**（1.4 / versionCode 5，125 KB，minSdk 24，v2+v3 双方案签名）。
 
 装前可核对：`sha256sum apk/qwen-image-2.1-oneclick.apk` 应与同目录 `.sha256` 文件一致 ——
 不一致说明包在传输路上被动过，别装。
@@ -112,10 +146,14 @@ QWEN21://<base64url({"kind":"ready","url":"https://xxxx.trycloudflare.com","toke
 cd android && ./build.sh
 ```
 
-只要机器上有 `javac`（JDK 17 实测可用），SDK 缺失会自动下载到 `android/.sdk/`，产出直接覆盖 `apk/` 里那一份。
+只要机器上有 `javac`，SDK 缺失会自动下载到 `android/.sdk/`，产出直接覆盖 `apk/` 里那一份。
 签名用固定的 `android/.keystore`（首次自动生成），所以升级安装不会因签名变化被系统拒掉。
 `build.sh` 签名后会先跑 `apksigner verify`，验不过就直接失败退出、不覆盖 `apk/` 里那一份 ——
 装不上的包不该进仓库，这个错误该留在构建机上，而不是留给装它的人。
+
+**用 JDK 17，别用 21。** build-tools 34 带的 d8 在 JDK 21 上会崩在
+`NullPointerException: Cannot invoke "String.length()"`，报的还是 `MainActivity$1.class`——
+一个只有四个空方法的匿名 TextWatcher，跟代码毫无关系。换 `JAVA_HOME` 到 17 就过。
 
 ## 9 张一起跑
 
@@ -203,6 +241,18 @@ owner 若是 `me`（hello 没探出账号时的兜底），Kaggle 回的是 `400
 
 ![设备实拍](docs/device/a14-ui.png)
 
+现在的第一眼是三页里的第一页，填完 Key 按「进入」直接落到创建页（右图）：
+
+| 填 Key | 创建（信封边算边显示） |
+| --- | --- |
+| ![](docs/device/a14-ui.png) | ![](docs/device/a14-terminal-create.png) |
+
+点「开始生成」当场翻到终端页，日志一行一行自己滚。下面这张是拿一个**假** Key 跑的：
+DNS 解析不了 `api.kaggle.com`，于是 `UnknownHostException` 被原样贴进日志，
+状态灯转红、按钮复位——失败路径该有的样子（真 Key 就走 push 内核那一条）：
+
+![终端日志](docs/device/a14-terminal-log.png)
+
 顺带把端上那条本地路径也验了：默认提示词在设备上现封密文是
 `cb210100005892cb064e14e381e64030b57ac39c…`（94B），
 `kaggle/verify_seal.py` 用独立 Python 实现算同一份输入，**字节级相同**。
@@ -210,6 +260,7 @@ owner 若是 `me`（hello 没探出账号时的兜底），Kaggle 回的是 `400
 
 ```bash
 python3 kaggle/verify_seal.py    # 密文 + 信封 packTask 双向校验
+python3 kaggle/test_console.py   # 控制台/回显那四个口：真的把节点模板装起来跑一遍
 ```
 
 没 Key 就点「一键出图」，也不会崩：状态灯转红「失败」，日志写
@@ -227,6 +278,10 @@ python3 kaggle/verify_seal.py    # 密文 + 信封 packTask 双向校验
   ①安装/启动/UI 渲染（A7 + A14 双版本实拍）②设备内密文与独立 Python 实现字节级一致
   ③无 Key 的失败路径优雅收场。再往后要 Kaggle 账号：`kernels/push` 起 T4、
   等隧道地址下发、出图取回，那一段需要真 Key 才能走，模拟器替不了。
+- **过程图只有 64×64 那点信息**。KV 预览本身就是缩略图，别指望它预示成品的画质；
+  它只回答「在动、到第几步」，成品还得看那四张。
+- **终端页是个 WebView，弱网会白一会儿**。白着的时候不是死了：本地那条 `log()`
+  仍在写，切到「过程图」那半边看的是原生直连，不受 WebView 影响。
 - **模拟器无 KVM 时极慢**：本次宿主没有 `/dev/kvm`，全程 QEMU TCG 纯软件模拟，
   Android 14 冷启约 5 分钟、偶发系统级 ANR 弹窗（是 `process system` / `System UI`
   超时，不是本 App）。这台机器上的截图因此拍得比较费劲，但 App 本身进程始终存活、界面正常。
