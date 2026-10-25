@@ -1,5 +1,8 @@
 *.keystore
 *.jks
 build/
+.build/
+.sdk/
 .gradle/
 local.properties
+*.idsig
