@@ -6,3 +6,5 @@ build/
 .gradle/
 local.properties
 *.idsig
+__pycache__/
+*.pyc
