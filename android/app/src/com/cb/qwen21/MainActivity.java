@@ -49,16 +49,21 @@ public class MainActivity extends Activity {
     private final List<Bitmap> results = new ArrayList<>();
 
     private SharedPreferences sp;
-    private EditText etUrl, etToken, etPrompt, etNeg, etSteps, etW, etH;
-    private TextView tvStatus, tvLog, tvTaskHex;
+    private EditText etUrl, etToken, etPrompt, etNeg, etSteps, etW, etH, etCfg, etSeed;
+    private TextView tvStatus, tvLog, tvTaskHex, tvPromptPreview;
     private LinearLayout gallery, statusDot;
     private ImageView preview;
-    private Button btnRun;
+    private Button btnRun, btnStyle, btnSave, btnBatch;
+    private int batch = 1;
+    private android.widget.CompoundButton swNsfw, swQuality;
+    private String styleName = "自动";
+    private byte[] lastPng;
 
     @Override
     protected void onCreate(Bundle b) {
         super.onCreate(b);
         sp = getSharedPreferences("qwen21", MODE_PRIVATE);
+        batch = Math.max(1, Math.min(4, sp.getInt("batch", 1)));
         setContentView(buildUi());
         renderTasks();
     }
@@ -91,6 +96,8 @@ public class MainActivity extends Activity {
         slp.leftMargin = Ui.dp(this, 8);
         dotRow.addView(tvStatus, slp);
         Ui.add(head, dotRow, 6);
+        TextView sub = Ui.label(this, "装好填地址即用 · 云端 T4 全程免跑脚本", 12, Ui.MUTED);
+        Ui.add(head, sub, 4);
         Ui.add(root, head, 0);
 
         // 连接面板
@@ -120,7 +127,38 @@ public class MainActivity extends Activity {
         task.addView(Ui.card(this, "② 输入任务"));
         etPrompt = Ui.input(this, "想要什么图？一句中文也行", sp.getString("prompt", ""), true);
         Ui.add(task, etPrompt, 10);
-        etNeg = Ui.input(this, "反向提示词（一般留空）", "", true);
+
+        // 风格 + NSFW + 自动补词
+        LinearLayout optRow = new LinearLayout(this);
+        optRow.setOrientation(LinearLayout.HORIZONTAL);
+        optRow.setGravity(Gravity.CENTER_VERTICAL);
+        btnStyle = btn("风格：" + styleName);
+        btnStyle.setOnClickListener(v -> pickStyle());
+        optRow.addView(btnStyle, new LinearLayout.LayoutParams(0,
+                ViewGroup.LayoutParams.WRAP_CONTENT, 1.4f));
+
+        LinearLayout swWrap = Ui.column(this);
+        swNsfw = new android.widget.Switch(this);
+        swNsfw.setText("NSFW");
+        swNsfw.setTextSize(13);
+        swNsfw.setTextColor(Ui.TEXT);
+        swNsfw.setChecked(sp.getBoolean("nsfw", true));
+        swWrap.addView(swNsfw);
+        swQuality = new android.widget.Switch(this);
+        swQuality.setText("补词");
+        swQuality.setTextSize(13);
+        swQuality.setTextColor(Ui.TEXT);
+        swQuality.setChecked(sp.getBoolean("quality", true));
+        swWrap.addView(swQuality);
+        optRow.addView(swWrap, new LinearLayout.LayoutParams(0,
+                ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        Ui.add(task, optRow, 10);
+
+        tvPromptPreview = Ui.label(this, "", 11, Ui.MUTED);
+        tvPromptPreview.setMaxLines(4);
+        Ui.add(task, tvPromptPreview, 8);
+
+        etNeg = Ui.input(this, "负面词（留空用内置干净版）", sp.getString("neg", ""), true);
         etNeg.setMinLines(1);
         Ui.add(task, etNeg, 8);
 
@@ -135,6 +173,17 @@ public class MainActivity extends Activity {
         nums.addView(wrapField("宽", etW), np);
         nums.addView(wrapField("高", etH), new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
         Ui.add(task, nums, 10);
+
+        LinearLayout nums2 = new LinearLayout(this);
+        nums2.setOrientation(LinearLayout.HORIZONTAL);
+        etCfg = Ui.input(this, "cfg", sp.getString("cfg", "1.0"), true);
+        etSeed = Ui.input(this, "种子(-1 随机)", sp.getString("seed", "-1"), true);
+        LinearLayout.LayoutParams np2 = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+        np2.rightMargin = Ui.dp(this, 8);
+        nums2.addView(wrapField("CFG", etCfg), np2);
+        nums2.addView(wrapField("种子", etSeed),
+                new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        Ui.add(task, nums2, 8);
 
         tvTaskHex = Ui.label(this, "", 11, Ui.MUTED);
         tvTaskHex.setTypeface(android.graphics.Typeface.MONOSPACE);
@@ -163,12 +212,24 @@ public class MainActivity extends Activity {
         // 结果
         LinearLayout res = Ui.panel(this);
         res.addView(Ui.card(this, "③ 结果"));
+        LinearLayout batchRow = new LinearLayout(this);
+        batchRow.setOrientation(LinearLayout.HORIZONTAL);
+        batchRow.setGravity(Gravity.CENTER_VERTICAL);
+        btnBatch = btn("一次 " + batch + " 张");
+        btnBatch.setOnClickListener(v -> pickBatch());
+        batchRow.addView(btnBatch, new LinearLayout.LayoutParams(0,
+                ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        Ui.add(res, batchRow, 10);
+
         preview = new ImageView(this);
         preview.setAdjustViewBounds(true);
         preview.setScaleType(ImageView.ScaleType.FIT_CENTER);
         preview.setBackground(Ui.rounded(this, 0xFF0B0F14, 12, Ui.LINE));
         preview.setMinimumHeight(Ui.dp(this, 200));
         Ui.add(res, preview, 10);
+        btnSave = btn("保存到相册");
+        btnSave.setOnClickListener(v -> saveToGallery());
+        Ui.add(res, btnSave, 8);
         gallery = Ui.column(this);
         Ui.add(res, gallery, 10);
         Ui.add(root, res, 14);
@@ -217,16 +278,73 @@ public class MainActivity extends Activity {
 
     private void renderTasks() {
         try {
-            String p = etPrompt.getText().toString();
-            if (p.isEmpty()) {
+            String raw = etPrompt.getText().toString().trim();
+            if (raw.isEmpty()) {
                 tvTaskHex.setText("等待输入任务…");
+                if (tvPromptPreview != null) tvPromptPreview.setText("");
                 return;
             }
-            byte[] blob = Crypto.encodeTask(p, key());
-            tvTaskHex.setText("本地加密 " + blob.length + "B · " + Crypto.hex(blob).substring(0, 48) + "…");
+            String full = Presets.compose(raw, styleName, swQuality != null && swQuality.isChecked());
+            if (tvPromptPreview != null) tvPromptPreview.setText("实际提示词：" + full);
+            byte[] blob = Crypto.encodeTask(raw, key());
+            tvTaskHex.setText("本地加密 " + blob.length + "B · " + Crypto.hex(blob).substring(0, 40) + "…");
         } catch (Exception e) {
             tvTaskHex.setText("加密失败: " + e.getMessage());
         }
+    }
+
+    private void pickStyle() {
+        new AlertDialog.Builder(this)
+                .setTitle("风格取向")
+                .setItems(Presets.STYLE_NAMES, (d, i) -> {
+                    styleName = Presets.STYLE_NAMES[i];
+                    btnStyle.setText("风格：" + styleName);
+                    renderTasks();
+                })
+                .show();
+    }
+
+    private void pickBatch() {
+        final String[] opts = {"1 张", "2 张", "4 张"};
+        final int[] vals = {1, 2, 4};
+        int cur = 0;
+        for (int i = 0; i < vals.length; i++) if (vals[i] == batch) cur = i;
+        new AlertDialog.Builder(this)
+                .setTitle("每批张数（越多越慢）")
+                .setSingleChoiceItems(opts, cur, (d, i) -> {
+                    batch = vals[i];
+                    btnBatch.setText("一次 " + batch + " 张");
+                    sp.edit().putInt("batch", batch).apply();
+                    d.dismiss();
+                })
+                .show();
+    }
+
+    /** 存到相册（MediaStore，无需存储权限）。 */
+    private void saveToGallery() {
+        if (lastPng == null) {
+            log("还没有可保存的图");
+            return;
+        }
+        pool.execute(() -> {
+            try {
+                String name = "qwen21_" + System.currentTimeMillis() + ".png";
+                android.content.ContentValues cv = new android.content.ContentValues();
+                cv.put(android.provider.MediaStore.Images.Media.DISPLAY_NAME, name);
+                cv.put(android.provider.MediaStore.Images.Media.MIME_TYPE, "image/png");
+                if (android.os.Build.VERSION.SDK_INT >= 29)
+                    cv.put(android.provider.MediaStore.Images.Media.RELATIVE_PATH, "Pictures/Qwen21");
+                Uri uri = getContentResolver().insert(
+                        android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cv);
+                if (uri == null) throw new IllegalStateException("相册不可写");
+                java.io.OutputStream os = getContentResolver().openOutputStream(uri);
+                os.write(lastPng);
+                os.close();
+                log("已保存到相册: Pictures/Qwen21/" + name);
+            } catch (Exception e) {
+                log("保存失败: " + e.getMessage());
+            }
+        });
     }
 
     private void log(String s) {
@@ -278,22 +396,34 @@ public class MainActivity extends Activity {
         cancelled.set(false);
         btnRun.setEnabled(false);
         btnRun.setText("生成中…");
-        final String prompt = etPrompt.getText().toString().trim();
-        if (prompt.isEmpty()) {
+        final String rawPrompt = etPrompt.getText().toString().trim();
+        if (rawPrompt.isEmpty()) {
             toastLog("任务为空");
             resetBtn();
             return;
         }
-        sp.edit().putString("prompt", prompt)
+        sp.edit().putString("prompt", rawPrompt)
                 .putString("steps", etSteps.getText().toString())
                 .putString("w", etW.getText().toString())
                 .putString("h", etH.getText().toString())
+                .putString("cfg", etCfg.getText().toString())
+                .putString("seed", etSeed.getText().toString())
+                .putString("neg", etNeg.getText().toString())
+                .putBoolean("nsfw", swNsfw.isChecked())
+                .putBoolean("quality", swQuality.isChecked())
                 .putString("url", etUrl.getText().toString().trim()).apply();
 
         final int steps = parseInt(etSteps.getText().toString(), 20);
         final int w = align(parseInt(etW.getText().toString(), 1024));
         final int h = align(parseInt(etH.getText().toString(), 1024));
-        final String neg = etNeg.getText().toString().trim();
+        final double cfg = parseD(etCfg.getText().toString(), 1.0);
+        final long seed = parseLong(etSeed.getText().toString(), -1L);
+        final boolean nsfw = swNsfw.isChecked();
+
+        final String prompt = Presets.compose(rawPrompt, styleName, swQuality.isChecked());
+        String negRaw = etNeg.getText().toString().trim();
+        if (negRaw.isEmpty()) negRaw = nsfw ? Presets.nsfwNegative() : "";
+        final String neg = nsfw ? Presets.stripCensor(negRaw) : negRaw;
 
         setStatus("提交中…", 0xFFE0B341);
         log("— 新任务 —");
@@ -324,9 +454,12 @@ public class MainActivity extends Activity {
                 }
 
                 // 3) 提交出图任务
-                JSONObject wf = Workflow.build(prompt, neg, w, h, steps,
-                        Math.abs(new java.util.Random().nextLong() % 1_000_000_000L), 1.0,
-                        DEF_UNET, DEF_CLIP, DEF_VAE, "apk");
+                long useSeed = seed >= 0 ? seed : Math.abs(new java.util.Random().nextLong() % 1_000_000_000L);
+                log("正向词 " + prompt.length() + " 字 · 负面词 " + (neg.isEmpty() ? "无" : neg.length() + " 字"));
+                log("参数 " + w + "x" + h + " · " + steps + " 步 · cfg " + cfg + " · seed " + useSeed
+                        + (nsfw ? " · NSFW 开" : ""));
+                JSONObject wf = Workflow.build(prompt, neg, w, h, steps, useSeed, cfg, batch,
+                        "euler", "simple", DEF_UNET, DEF_CLIP, DEF_VAE, "apk");
                 afterSubmit(a.submit(wf), a, blob);
 
             } catch (Exception e) {
@@ -354,15 +487,26 @@ public class MainActivity extends Activity {
         // 4) 取回图片 -> 端上解密回原文，验证加密链路闭环
         JSONArray imgs = Api.images(hist);
         if (imgs.length() == 0) throw new IllegalStateException("没有返回图片");
-        JSONObject im = imgs.getJSONObject(0);
-        byte[] raw = a.view(im.optString("filename"), im.optString("subfolder"), im.optString("type", "output"));
-        Bitmap bmp = BitmapFactory.decodeByteArray(raw, 0, raw.length);
-        if (bmp == null) throw new IllegalStateException("图片解码失败");
+        java.util.List<Bitmap> got = new ArrayList<>();
+        byte[] firstPng = null;
+        for (int i = 0; i < imgs.length(); i++) {
+            JSONObject im = imgs.getJSONObject(i);
+            if (!"output".equals(im.optString("type", "output"))) continue;
+            byte[] raw = a.view(im.optString("filename"), im.optString("subfolder"), im.optString("type", "output"));
+            Bitmap bmp = BitmapFactory.decodeByteArray(raw, 0, raw.length);
+            if (bmp == null) continue;
+            if (firstPng == null) firstPng = raw;
+            got.add(bmp);
+        }
+        if (got.isEmpty()) throw new IllegalStateException("图片解码失败");
+        final byte[] png = firstPng;
         String echo = Crypto.decodeTask(blob, key());
-        log("④ 出图成功 " + bmp.getWidth() + "x" + bmp.getHeight() + " · 本地解密校验: " + echo);
+        log("④ 出图成功 " + got.size() + " 张 " + got.get(0).getWidth() + "x" + got.get(0).getHeight()
+                + " · 本地解密校验: " + echo);
         ui.post(() -> {
-            results.add(0, bmp);
-            preview.setImageBitmap(bmp);
+            for (int i = got.size() - 1; i >= 0; i--) results.add(0, got.get(i));
+            lastPng = png;
+            preview.setImageBitmap(got.get(0));
             rebuildGallery();
             setStatus("完成", Ui.ACCENT);
             resetBtn();
@@ -399,6 +543,24 @@ public class MainActivity extends Activity {
     private static int parseInt(String s, int def) {
         try {
             return Integer.parseInt(s.trim());
+        } catch (Exception e) {
+            return def;
+        }
+    }
+
+    private static double parseD(String s, double def) {
+        try {
+            double v = Double.parseDouble(s.trim());
+            return v < 0 ? def : Math.min(30, v);
+        } catch (Exception e) {
+            return def;
+        }
+    }
+
+    private static long parseLong(String s, long def) {
+        try {
+            long v = Long.parseLong(s.trim());
+            return v < 0 ? def : v;
         } catch (Exception e) {
             return def;
         }

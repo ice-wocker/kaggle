@@ -10,8 +10,8 @@ Kaggle 免费 GPU 跑 `Qwen-Image-2.1-Uncensored` 的 **INT8** 量化版，Andro
 
 ```
 kaggle/          Kaggle 端：ComfyUI + 加密节点 + 出图/常驻服务
-android/         APK 源码（纯 Java，不依赖 AndroidX/Gradle）
-apk/             已签名安装包
+android/         APK 源码（纯 Java，不依赖 AndroidX/Gradle）+ 一条命令构建
+apk/             已签名安装包（预编译，直接装）
 docs/            实测产物（出图、密文图、运行摘要）
 ```
 
@@ -43,13 +43,29 @@ cd kaggle && kaggle kernels push
 
 `main_cell.py` 里 `Mode = "serve"` 可切成常驻服务 + trycloudflare 隧道，浏览器也能用。
 
-## APK
+## APK（已编译，直接装）
+
+安装包在仓库里：**[`apk/qwen-image-2.1-oneclick.apk`](apk/qwen-image-2.1-oneclick.apk)**（33 KB，minSdk 24，已签名）。
+
+不用自己跑构建。下载 → 装机 → 填云端地址 → 点「一键生成」。
+
+装好后能做什么：
+
+- **风格预设**：自动 / 写实摄影 / 电影感 / 日系插画 / 赛博朋克 / 胶片质感 / 3D 渲染 / 线稿上色
+- **NSFW 开关**（默认开）：开时会自动从你的负面词里剥掉 `nsfw`/`nude`/`裸露` 这类自我审查项，留空则填一套只压解剖崩坏的负面词
+- **补词开关**（默认开）：只在你没写够细节时才追加质量词，写满了就不动，免得稀释意图
+- **实际提示词实时预览**：发出去之前先看你到底发了什么
+- 步数 / 宽 / 高 / CFG / 种子（`-1` 随机，填定值可复现）
+- 一次出多张、缩略图切换、一键存相册（`Pictures/Qwen21/`，走 MediaStore 不需要存储权限）
+
+### 自己编译
 
 ```bash
-cd android && ./build.sh    # 需要 javac + Android SDK 34 build-tools
+cd android && ./build.sh
 ```
 
-装好后填云端地址、输任务、点「一键生成」。
+只要机器上有 `javac`，SDK 缺失会自动下载到 `android/.sdk/`，产出直接覆盖 `apk/` 里那一份。
+签名用固定的 `android/.keystore`（首次自动生成），所以升级安装不会因签名变化被系统拒掉。
 
 ## 加密链路
 

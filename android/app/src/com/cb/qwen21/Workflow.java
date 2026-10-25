@@ -11,6 +11,13 @@ final class Workflow {
     static JSONObject build(String prompt, String negative, int width, int height,
                             int steps, long seed, double cfg, String unet, String clip, String vae,
                             String tagPrefix) throws Exception {
+        return build(prompt, negative, width, height, steps, seed, cfg, 1, "euler", "simple",
+                unet, clip, vae, tagPrefix);
+    }
+
+    static JSONObject build(String prompt, String negative, int width, int height,
+                            int steps, long seed, double cfg, int batch, String sampler, String scheduler,
+                            String unet, String clip, String vae, String tagPrefix) throws Exception {
         JSONObject wf = new JSONObject();
         wf.put("1", node("UNETLoader", "unet_name", unet, "weight_dtype", "default"));
         wf.put("2", node("CLIPLoader", "clip_name", clip, "type", "qwen_image", "device", "default"));
@@ -31,7 +38,7 @@ final class Workflow {
         JSONObject li = new JSONObject();
         li.put("width", width);
         li.put("height", height);
-        li.put("batch_size", 1);
+        li.put("batch_size", Math.max(1, Math.min(4, batch)));
         lat.put("inputs", li);
         wf.put("5", lat);
 
@@ -45,8 +52,8 @@ final class Workflow {
         ki.put("seed", seed);
         ki.put("steps", steps);
         ki.put("cfg", cfg);
-        ki.put("sampler_name", "euler");
-        ki.put("scheduler", "simple");
+        ki.put("sampler_name", sampler == null || sampler.isEmpty() ? "euler" : sampler);
+        ki.put("scheduler", scheduler == null || scheduler.isEmpty() ? "simple" : scheduler);
         ki.put("denoise", 1.0);
         ks.put("inputs", ki);
         wf.put("6", ks);
