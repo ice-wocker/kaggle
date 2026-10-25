@@ -1,0 +1,20 @@
+{
+  "prompt": "一只穿西装的猫，赛博朋克城市夜景，电影感打光，85mm 浅景深",
+  "steps": 20,
+  "size": [
+    1024,
+    1024
+  ],
+  "seed": 20261025,
+  "elapsed_sec": 236.2,
+  "outputs": [
+    {
+      "filename": "cipher_00002_.png",
+      "saved": "/kaggle/working/output/852e4111_0_cipher_00002_.png"
+    },
+    {
+      "filename": "unc_00001_.png",
+      "saved": "/kaggle/working/output/852e4111_1_unc_00001_.png"
+    }
+  ]
+}

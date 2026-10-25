@@ -3,14 +3,20 @@
 Qwen-Image-2.1 Uncensored (INT8) on Kaggle free GPU + ComfyUI
 一键启动：安装依赖 -> 下载 int8 权重 -> 启动 ComfyUI -> 本地加密节点出图
 """
-import base64, hashlib, json, os, re, shutil, struct, subprocess, sys, threading, time, urllib.parse, urllib.request
+import base64, hashlib, json, math, os, re, shutil, struct, subprocess, sys, threading, time
+import urllib.error, urllib.parse, urllib.request
 
+import numpy as np
+
+# /kaggle/working 只有 ~20G，放不下 ComfyUI + 16G 权重；
+# 大件放 /tmp（Kaggle 上空间更宽），working 只留结果和日志。
 WORK = "/kaggle/working"
-COMFY = os.path.join(WORK, "ComfyUI")
+TMP = "/tmp/qwen21"
+COMFY = os.path.join(TMP, "ComfyUI")
 OUT = os.path.join(WORK, "output")
-LOG_DIR = os.path.join(WORK, "logs")
-os.makedirs(OUT, exist_ok=True)
-os.makedirs(LOG_DIR, exist_ok=True)
+LOG_DIR = os.path.join(TMP, "logs")
+for d in (TMP, OUT, LOG_DIR):
+    os.makedirs(d, exist_ok=True)
 
 # ---------- 基础配置 ----------
 BASE_MODEL_REPO = "abenzerps/Qwen-Image-2.1-Uncensored-Quantized"
@@ -28,14 +34,42 @@ VAE_NAME = "qwen_image_2.1_vae_bf16.safetensors"
 
 
 def sh(cmd, log=None, check=False):
+    """跑命令；log 指定时把 stdout+stderr 一并落盘，失败抛出日志尾部。"""
     print(">>>", cmd, flush=True)
     if log:
-        f = open(log, "a"); p = subprocess.Popen(cmd, shell=True, stdout=f, stderr=subprocess.STDOUT)
-        p.wait()
-        if check and p.returncode:
-            raise RuntimeError(f"{cmd} -> {p.returncode}")
-        return p.returncode
-    return subprocess.call(cmd, shell=True)
+        os.makedirs(os.path.dirname(log), exist_ok=True)
+        with open(log, "a") as f:
+            f.write(f"\n===== {time.strftime('%H:%M:%S')} {cmd}\n")
+            f.flush()
+            rc = subprocess.call(cmd, shell=True, stdout=f, stderr=subprocess.STDOUT)
+        if check and rc:
+            raise RuntimeError(f"{cmd} -> rc={rc}\n" + tail_log(log))
+        return rc
+    rc = subprocess.call(cmd, shell=True)
+    if check and rc:
+        raise RuntimeError(f"{cmd} -> rc={rc}")
+    return rc
+
+
+def mark(msg):
+    """把进度写进 output，失败后也能从产物里看出卡在哪。"""
+    try:
+        with open(os.path.join(OUT, "progress.log"), "a") as f:
+            f.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
+    except Exception:
+        pass
+    print("[progress]", msg, flush=True)
+
+
+def tail_log(path, n=60):
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 20000))
+            return f.read().decode("utf-8", "replace")[-4000:]
+    except Exception:
+        return ""
 
 
 def has_gpu():
@@ -52,21 +86,57 @@ def has_gpu():
 
 
 def install():
-    """装 ComfyUI + 依赖。PyTorch 用 Kaggle 自带的，不动。"""
+    """装 ComfyUI + 依赖。PyTorch 用 Kaggle 自带的，不重装。"""
+    mark("install: 开始")
     if not os.path.isdir(COMFY):
-        sh(f"git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git {COMFY}", check=True)
-    else:
-        sh(f"cd {COMFY} && git pull --ff-only || true")
+        sh(f"git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git {COMFY}",
+           log=os.path.join(LOG_DIR, "setup.log"), check=True)
+    mark("install: clone 完成")
+
     with open(os.path.join(COMFY, "requirements.txt")) as f:
-        reqs = [l.strip() for l in f if l.strip() and not l.startswith("#")]
-    reqs = [r for r in reqs if not r.lower().startswith("torch")]
+        lines = [l.strip() for l in f if l.strip() and not l.startswith("#")]
+    # 只跳过镜像自带的 torch / torchvision（重装会拉 CUDA 轮子覆盖环境）。
+    # torchsde、torchvision 之外的小包照装 —— 少装一个就起不来。
+    def _preinstalled(line):
+        name = re.split(r"[=<>\[!~ ]", line.lower(), 1)[0]
+        return name in ("torch", "torchvision")
+    reqs = [l for l in lines if not _preinstalled(l)]
     rf = os.path.join(WORK, "reqs.txt")
-    open(rf, "w").write("\n".join(reqs))
-    sh(f"{sys.executable} -m pip install -q --no-warn-script-location -r {rf}", log=os.path.join(LOG_DIR, "pip.log"))
-    # 关键补丁：GPU 上跑 int8 tensor-core 需要 torchao / 特定算子；缺了就报错，装上
-    sh(f"{sys.executable} -m pip install -q torchao 2>/dev/null || true")
+    open(rf, "w").write("\n".join(reqs) + "\n")
+    print(f"deps: {len(reqs)} 条（跳过 {len(lines) - len(reqs)} 条 torch*）", flush=True)
+
+    mark(f"install: 开始装 {len(reqs)} 条依赖")
+    pip_log = os.path.join(LOG_DIR, "pip.log")
+    rc = sh(f"{sys.executable} -m pip install --no-warn-script-location -r {rf}", log=pip_log)
+    if rc:
+        # 逐条重试，让单条坏依赖不拖死整批
+        print("批量安装失败，逐条重试", flush=True)
+        bad = []
+        for r in reqs:
+            if sh(f"{sys.executable} -m pip install -q --no-warn-script-location '{r}'", log=pip_log):
+                bad.append(r)
+        if bad:
+            print("装不上的依赖（继续跑，运行时再看）:", bad, flush=True)
+
+    # 启动前的依赖自检：缺模块提前补，别等 ComfyUI 跑到一半才炸
+    need = ["torchsde", "einops", "transformers", "safetensors", "aiohttp",
+            "yaml", "PIL", "scipy", "tqdm", "psutil", "alembic", "sqlalchemy", "filelock"]
+    import importlib
+    missing = []
+    for m in need:
+        try:
+            importlib.import_module(m)
+        except Exception:
+            missing.append(m)
+    if missing:
+        mark(f"install: 补装缺失模块 {missing}")
+        pkg = {"yaml": "pyyaml", "PIL": "pillow", "sqlalchemy": "sqlalchemy"}
+        sh(f"{sys.executable} -m pip install -q --no-warn-script-location "
+           + " ".join(pkg.get(m, m) for m in missing), log=os.path.join(LOG_DIR, "pip.log"))
+
     for d in ("diffusion_models", "text_encoders", "vae"):
         os.makedirs(os.path.join(COMFY, "models", d), exist_ok=True)
+    mark("install: 完成")
     return COMFY
 
 
@@ -149,21 +219,19 @@ def install_crypto_node(seed):
     """
     d = os.path.join(COMFY, "custom_nodes", "comfy_node_crypt")
     os.makedirs(d, exist_ok=True)
-    open(os.path.join(d, "__init__.py"), "w").write(CRYPT_NODE_SRC)
+    # 节点文件 = 模板 + 模块级算法，保证两处永远同源
+    node_src = CRYPT_NODE_SRC_TEMPLATE.replace("@@ALGO@@", ALGO_SRC)
+    open(os.path.join(d, "__init__.py"), "w").write(node_src)
+    mark(f"crypto-node: 已写入 {len(node_src)} 字节")
     return d
 
 
-CRYPT_NODE_SRC = r'''
-import hashlib, io, json, struct
-import numpy as np
-import torch
-from PIL import Image
-import folder_paths
-
-MASK = (1 << 64) - 1
+# ================== 密文图算法（模块级，节点与自检共用） ==================
+MIN_SIDE = 32  # 密文图最小边长；码字多时自动长大，保持接近 100% 的填充率
+FILL = 0xE000  # 填充码字：高 4 位标记位，不会与真实数据混淆
 
 
-def _keystream(key: bytes, nonce: bytes, n: int):
+def _keystream(key, nonce, n):
     out = bytearray()
     ctr = 0
     while len(out) < n:
@@ -172,13 +240,11 @@ def _keystream(key: bytes, nonce: bytes, n: int):
     return bytes(out[:n])
 
 
-def _feistel(data: bytes, key: bytes):
-    """4 轮 Add-Rotate-XOR block cipher，块 8 字节。"""
-    if not data:
-        return b""
+def _feistel(data, key):
+    """4 轮 ARX（加-转-XOR）块密码，8 字节分组，PKCS#7 填充。"""
     pad = 8 - (len(data) % 8)
     data = data + bytes([pad]) * pad
-    subkeys = [int.from_bytes(hashlib.sha256(key + b"k%d" % i).digest()[:8], "big") for i in range(4)]
+    subkeys = [int.from_bytes(hashlib.sha256(key + b"k%d" % i).digest()[:4], "big") for i in range(4)]
     out = bytearray()
     for off in range(0, len(data), 8):
         l = int.from_bytes(data[off:off + 4], "big")
@@ -188,12 +254,11 @@ def _feistel(data: bytes, key: bytes):
             r = (l ^ (((r << 3 | r >> 29) & 0xFFFFFFFF) + sk & 0xFFFFFFFF)) & 0xFFFFFFFF
             l = nl
         out += l.to_bytes(4, "big") + r.to_bytes(4, "big")
-    # 字节级扩散，破坏局部统计
     return bytes(a ^ b for a, b in zip(out, _keystream(key, b"diffuse", len(out))))
 
 
-def _unfeistel(data: bytes, key: bytes):
-    subkeys = [int.from_bytes(hashlib.sha256(key + b"k%d" % i).digest()[:8], "big") for i in range(4)]
+def _unfeistel(data, key):
+    subkeys = [int.from_bytes(hashlib.sha256(key + b"k%d" % i).digest()[:4], "big") for i in range(4)]
     data = bytes(a ^ b for a, b in zip(data, _keystream(key, b"diffuse", len(data))))
     out = bytearray()
     for off in range(0, len(data), 8):
@@ -204,11 +269,184 @@ def _unfeistel(data: bytes, key: bytes):
             l = (r ^ (((l << 3 | l >> 29) & 0xFFFFFFFF) + sk & 0xFFFFFFFF)) & 0xFFFFFFFF
             r = nr
         out += l.to_bytes(4, "big") + r.to_bytes(4, "big")
-    pad = out[-1]
-    return bytes(out[:-pad])
+    return bytes(out[:-out[-1]])
 
 
-GRID = 4096  # 位图边长（4096^2 像素 = 1600 万像素级，光栅压不坏）
+
+def _side_for(count):
+    """
+    码字数 -> 画布边长。边长取 2 的幂（从 MIN_SIDE 起翻倍）：
+    这样 side*side 也是 2 的幂，位反转才能构成严格双射，铺满且不重位。
+    """
+    side = MIN_SIDE
+    while side * side < count:
+        side *= 2
+    return side
+
+
+def _slot(i, side):
+    """
+    码字序号 -> 像素线性下标。对 side*side 个格子做位反转（Van der Corput）：
+    任意前缀都铺得最均匀。side 是 2 的幂 => bit_length-1 位刚好覆盖全空间。
+    """
+    bits = (side * side).bit_length() - 1
+    x = i % (side * side)
+    r = 0
+    for _ in range(bits):
+        r = (r << 1) | (x & 1)
+        x >>= 1
+    return r
+
+
+def render(words):
+    """码字列表 -> side x side x 3 uint8 图。三通道互异，肉眼是彩色噪声。"""
+    side = _side_for(len(words))
+    n = side * side
+    flat = np.full(n, FILL, dtype=np.uint16)
+    for i, w in enumerate(words):
+        if i < n:
+            flat[_slot(i, side)] = w
+    g = ((flat >> 8) & 0xFF).astype(np.uint8).reshape(side, side)
+    b = (flat & 0xFF).astype(np.uint8).reshape(side, side)
+    img = np.empty((side, side, 3), dtype=np.uint8)
+    img[:, :, 0] = g ^ b
+    img[:, :, 1] = g
+    img[:, :, 2] = b
+    return img
+
+
+def unrender(img, count):
+    """图 -> 前 count 个码字。客户端 Crypto.java 用同一公式。"""
+    side = img.shape[0]
+    a = img.reshape(-1, 3).astype(np.uint16)
+    flat = (a[:, 1] << 8) | a[:, 2]
+    return [int(flat[_slot(i, side)]) for i in range(count)]
+
+
+def image_to_tensor(img):
+    return torch.from_numpy(img.astype(np.float32) / 255.0)[None]
+
+
+def encode_words(seed, text):
+    """明文 -> 码字数组，与 EncryptText 节点同构（给自检用）。"""
+    key = hashlib.sha256(seed.encode("utf-8")).digest()
+    ct = _feistel(text.encode("utf-8"), key)
+    blob = b"\xCB\x21\x01\x00" + len(ct).to_bytes(2, "big") + ct
+    return [FILL | (b << 4) for b in blob]
+
+
+def decode_words(words, seed):
+    """码字数组 -> 明文（给自检用）。"""
+    blob = bytes((w >> 4) & 0xFF for w in words)
+    if blob[:2] != b"\xCB\x21":
+        raise ValueError("密文头不对")
+    n = int.from_bytes(blob[4:6], "big")
+    key = hashlib.sha256(seed.encode("utf-8")).digest()
+    return _unfeistel(blob[6:6 + n], key).decode("utf-8")
+# ========================================================================
+
+# 节点文件里要用的算法源码：显式写一份，避免 inspect 在 notebook 里取不到源码
+ALGO_SRC = '''
+import math
+
+FILL = {fill}
+MIN_SIDE = {min_side}
+
+
+def _keystream(key, nonce, n):
+    out = bytearray()
+    ctr = 0
+    while len(out) < n:
+        out += hashlib.sha256(key + nonce + struct.pack("<I", ctr)).digest()
+        ctr += 1
+    return bytes(out[:n])
+
+
+def _feistel(data, key):
+    """4 轮 ARX（加-转-XOR）块密码，8 字节分组，PKCS#7 填充。"""
+    pad = 8 - (len(data) % 8)
+    data = data + bytes([pad]) * pad
+    subkeys = [int.from_bytes(hashlib.sha256(key + b"k%d" % i).digest()[:4], "big") for i in range(4)]
+    out = bytearray()
+    for off in range(0, len(data), 8):
+        l = int.from_bytes(data[off:off + 4], "big")
+        r = int.from_bytes(data[off + 4:off + 8], "big")
+        for sk in subkeys:
+            nl = r
+            r = (l ^ (((r << 3 | r >> 29) & 0xFFFFFFFF) + sk & 0xFFFFFFFF)) & 0xFFFFFFFF
+            l = nl
+        out += l.to_bytes(4, "big") + r.to_bytes(4, "big")
+    return bytes(a ^ b for a, b in zip(out, _keystream(key, b"diffuse", len(out))))
+
+
+def _unfeistel(data, key):
+    subkeys = [int.from_bytes(hashlib.sha256(key + b"k%d" % i).digest()[:4], "big") for i in range(4)]
+    data = bytes(a ^ b for a, b in zip(data, _keystream(key, b"diffuse", len(data))))
+    out = bytearray()
+    for off in range(0, len(data), 8):
+        l = int.from_bytes(data[off:off + 4], "big")
+        r = int.from_bytes(data[off + 4:off + 8], "big")
+        for sk in reversed(subkeys):
+            nr = l
+            l = (r ^ (((l << 3 | l >> 29) & 0xFFFFFFFF) + sk & 0xFFFFFFFF)) & 0xFFFFFFFF
+            r = nr
+        out += l.to_bytes(4, "big") + r.to_bytes(4, "big")
+    return bytes(out[:-out[-1]])
+
+
+def _side_for(count):
+    side = MIN_SIDE
+    while side * side < count:
+        side *= 2
+    return side
+
+
+def _slot(i, side):
+    bits = (side * side).bit_length() - 1
+    x = i % (side * side)
+    r = 0
+    for _ in range(bits):
+        r = (r << 1) | (x & 1)
+        x >>= 1
+    return r
+
+
+def render(words):
+    side = _side_for(len(words))
+    n = side * side
+    flat = np.full(n, FILL, dtype=np.uint16)
+    for i, w in enumerate(words):
+        if i < n:
+            flat[_slot(i, side)] = w
+    g = ((flat >> 8) & 0xFF).astype(np.uint8).reshape(side, side)
+    b = (flat & 0xFF).astype(np.uint8).reshape(side, side)
+    img = np.empty((side, side, 3), dtype=np.uint8)
+    img[:, :, 0] = g ^ b
+    img[:, :, 1] = g
+    img[:, :, 2] = b
+    return img
+
+
+def unrender(img, count):
+    side = img.shape[0]
+    a = img.reshape(-1, 3).astype(np.uint16)
+    flat = (a[:, 1] << 8) | a[:, 2]
+    return [int(flat[_slot(i, side)]) for i in range(count)]
+
+
+def image_to_tensor(img):
+    return torch.from_numpy(img.astype(np.float32) / 255.0)[None]
+'''.format(fill=hex(FILL), min_side=MIN_SIDE)
+
+
+CRYPT_NODE_SRC_TEMPLATE = r'''
+import hashlib, json, struct
+import numpy as np
+import torch
+
+
+# ===== 共享算法（与模块级 ALGO 同源，构建时注入）=====
+@@ALGO@@
 
 
 class EncryptText:
@@ -229,34 +467,16 @@ class EncryptText:
 
     def run(self, text, seed, label="1"):
         key = hashlib.sha256(seed.encode("utf-8")).digest()
-        payload = json.dumps({"t": text}, ensure_ascii=False).encode("utf-8")
-        ct = _feistel(payload, key)
-        blob = b"CBX1" + struct.pack("<HH", int(label), len(ct)) + ct
-        # 码字：每个字节 -> 16 位，低 4 位放前导标记，剩余 12 位承载
-        words = []
-        for b in blob:
-            words.append(0xE000 | (b << 4))
-        need = (len(words) + 2 + 63) // 64 * 64
-        enc = {"v": 1, "codec": "feistel-xor-nibble12", "label": int(label),
-               "len": len(blob), "digest": hashlib.sha256(blob).hexdigest()[:16], "data": words}
+        ct = _feistel(text.encode("utf-8"), key)
+        # 头：CB 21 01 00 | len(2, big-endian) | 密文。与 APK 的 Crypto.encodeTask 一致
+        blob = b"\xCB\x21\x01\x00" + len(ct).to_bytes(2, "big") + ct
+        # 每个字节 -> 16 位码字：高 4 位留标记，低 12 位承载（8 位数据 + 4 位冗余）
+        words = [FILL | (b << 4) for b in blob]
+        enc = {"v": 3, "codec": "feistel-arx-bitrev", "label": int(label),
+               "side": _side_for(len(words)),
+               "len": len(words), "digest": hashlib.sha256(blob).hexdigest()[:16]}
         info = "CBX1:" + json.dumps(enc, separators=(",", ":"))
-        # 渲染：把 16 位码字写进像素，alpha=255，视觉是等高线噪声
-        n = need
-        side = int(np.ceil(np.sqrt(n)))
-        flat = np.zeros(side * side, dtype=np.uint16)
-        flat[:n] = np.array(words + [0xE000] * (n - len(words)), dtype=np.uint16)
-        rng = np.random.RandomState(int(hashlib.sha256(seed.encode()).hexdigest()[:8], 16))
-        # 抖散：用 seed 派生的位置置换，防肉眼对齐规律
-        perm = rng.permutation(side * side)
-        flat = flat[perm].reshape(side, side)
-        g = ((flat >> 8) & 0xFF).astype(np.uint8)
-        b = (flat & 0xFF).astype(np.uint8)
-        img = np.zeros((side, side, 3), dtype=np.uint8)
-        img[:, :, 0] = (g ^ b)
-        img[:, :, 1] = g
-        img[:, :, 2] = b
-        t = torch.from_numpy(img.astype(np.float32) / 255.0)[None]
-        return (t, info)
+        return (image_to_tensor(render(words)), info)
 
 
 class DecryptText:
@@ -273,26 +493,39 @@ class DecryptText:
     def run(self, info, seed, image=None):
         js = json.loads(info.split("CBX1:", 1)[-1])
         key = hashlib.sha256(seed.encode("utf-8")).digest()
-        ct = b"".join(bytes([(w >> 4) & 0xFF]) for w in js["data"][:js["len"] - 4])
+        if image is not None:
+            # 从像素还原码字：图是唯一载体
+            arr = (image[0].cpu().numpy() * 255.0).round().astype(np.uint8)
+            words = unrender(arr, js["len"])
+        else:
+            raise ValueError("需要密文图才能解密")
+        ct = bytes((w >> 4) & 0xFF for w in words[6:js["len"]])
         return (_unfeistel(ct, key).decode("utf-8"),)
 
 
 NODE_CLASS_MAPPINGS = {"EncryptText": EncryptText, "DecryptText": DecryptText}
-NODE_DISPLAY_NAME_MAPPINGS = {"EncryptText": "🔒 Encrypt Text", "DecryptText": "🔓 Decrypt Text"}
-'''
+NODE_DISPLAY_NAME_MAPPINGS = {"EncryptText": "🔒 Encrypt Text", "DecryptText": "🔓 Decrypt Text"}'''
+
+CRYPT_NODE_SRC = CRYPT_NODE_SRC_TEMPLATE  # 安装时用 ALGO 填充，见 install_crypto_node
+
 
 
 # ---------- ComfyUI API ----------
 def api(path, payload=None, timeout=60):
+    """调 ComfyUI HTTP API；4xx/5xx 时把响应体一起抛出来，否则排错全靠猜。"""
     url = COMFY_URL + path
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        raw = r.read()
-        try:
-            return json.loads(raw)
-        except Exception:
-            return raw
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read()
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", "replace")
+        raise RuntimeError(f"{path} -> HTTP {e.code}: {body[:3000]}") from None
+    try:
+        return json.loads(raw)
+    except Exception:
+        return raw
 
 
 def build_wf(prompt, seed=42, steps=20, width=1024, height=1024, cfg=1.0, enc_text=None, enc_seed=None):
@@ -310,8 +543,10 @@ def build_wf(prompt, seed=42, steps=20, width=1024, height=1024, cfg=1.0, enc_te
         "8": {"class_type": "SaveImage", "inputs": {"images": ["7", 0], "filename_prefix": "unc"}},
     }
     if enc_text is not None:
-        # 服务端加密节点：把任务文本编成密文图并留档
+        # 加密节点挂进主图：EncryptText 的密文图一起存盘留档，
+        # 这样它属于 SaveImage 的上游，不会被判成孤立节点
         wf["90"] = {"class_type": "EncryptText", "inputs": {"text": enc_text, "seed": enc_seed or "k"}}
+        wf["91"] = {"class_type": "SaveImage", "inputs": {"images": ["90", 0], "filename_prefix": "cipher"}}
     return wf
 
 
@@ -355,13 +590,17 @@ VERIFY_PROMPT = "一只穿西装的猫，赛博朋克城市夜景 test 🎨"
 
 
 def verify_crypto(seed):
-    """在 ComfyUI 里跑 EncryptText -> DecryptText，确认加密节点闭环。"""
+    """
+    跑 EncryptText -> DecryptText，并把解密结果和密文图都落到 output。
+    ComfyUI 要求工作流至少有一个输出节点，所以挂 SaveImage 收加密图。
+    """
     wf = {
         "1": {"class_type": "EncryptText", "inputs": {"text": VERIFY_PROMPT, "seed": seed}},
         "2": {"class_type": "DecryptText", "inputs": {"info": ["1", 1], "seed": seed}},
+        "3": {"class_type": "SaveImage", "inputs": {"images": ["1", 0], "filename_prefix": "cipher"}},
     }
-    r = run_wf(wf, want_files=False, timeout=300)
-    print("crypto roundtrip artifact:", r.get("images"))
+    r = run_wf(wf, timeout=300)
+    print("crypto roundtrip artifact:", json.dumps(r.get("images"), ensure_ascii=False), flush=True)
     return r
 
 
