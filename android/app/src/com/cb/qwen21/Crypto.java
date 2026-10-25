@@ -147,4 +147,82 @@ final class Crypto {
         for (byte x : b) sb.append(String.format("%02x", x));
         return sb.toString();
     }
+
+    // ---------- 密文图：位反转铺满的码字画布 ----------
+    /** 密文图最小边长；码字多时翻倍，边长始终是 2 的幂。 */
+    static final int MIN_SIDE = 32;
+    /** 填充码字：高 4 位标记位，不与真实数据混淆。 */
+    static final int FILL = 0xE000;
+
+    /** 码字数 -> 画布边长。边长取 2 的幂，位反转才是严格双射。 */
+    static int sideFor(int count) {
+        int side = MIN_SIDE;
+        while (side * side < count) side *= 2;
+        return side;
+    }
+
+    /**
+     * 码字序号 -> 像素线性下标。对 side*side 个格子做位反转（Van der Corput），
+     * 任意前缀都铺得最均匀。与 ComfyUI 端 _slot() 完全一致。
+     */
+    static int slot(int i, int side) {
+        int n = side * side;
+        int bits = 32 - Integer.numberOfLeadingZeros(n) - 1; // n 是 2 的幂
+        int x = i % n;
+        int r = 0;
+        for (int b = 0; b < bits; b++) {
+            r = (r << 1) | (x & 1);
+            x >>= 1;
+        }
+        return r;
+    }
+
+    /** 把码字写进 ARGB 像素：G=高字节, B=低字节, R=两者异或。 */
+    static int[] renderWords(int[] words) {
+        int side = sideFor(words.length);
+        int n = side * side;
+        int[] px = new int[n];
+        java.util.Arrays.fill(px, encodeWord(FILL));
+        for (int i = 0; i < words.length && i < n; i++) {
+            px[slot(i, side)] = encodeWord(words[i]);
+        }
+        return px;
+    }
+
+    static int encodeWord(int w) {
+        int g = (w >> 8) & 0xFF, b = w & 0xFF;
+        return 0xFF000000 | ((g ^ b) << 16) | (g << 8) | b;
+    }
+
+    /** 从 ARGB 像素还原前 count 个码字。 */
+    static int[] unrenderWords(int[] argb, int count) {
+        int side = (int) Math.round(Math.sqrt(argb.length));
+        int[] out = new int[count];
+        for (int i = 0; i < count; i++) {
+            int c = argb[slot(i, side)];
+            int g = (c >> 8) & 0xFF;
+            int b = c & 0xFF;
+            out[i] = (g << 8) | b;
+        }
+        return out;
+    }
+
+    /** 任务明文 -> 码字数组（含 6 字节头）。 */
+    static int[] encodeTaskWords(String prompt, byte[] key) {
+        byte[] blob = encodeTask(prompt, key);
+        int[] words = new int[blob.length];
+        for (int i = 0; i < blob.length; i++) {
+            words[i] = FILL | ((blob[i] & 0xFF) << 4);
+        }
+        return words;
+    }
+
+    /** 码字数组 -> 任务明文。 */
+    static String decodeTaskWords(int[] words, byte[] key) {
+        byte[] blob = new byte[words.length];
+        for (int i = 0; i < words.length; i++) {
+            blob[i] = (byte) ((words[i] >> 4) & 0xFF);
+        }
+        return decodeTask(blob, key);
+    }
 }
