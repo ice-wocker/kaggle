@@ -30,7 +30,7 @@ final class Kaggle {
     static final String HOST = "https://www.kaggle.com";
     static final String SLUG = "qwen-image-2-1-uncensored-int8-serve";
     /** 内核代码版本。改了 notebook 就要 +1，否则手机上旧版会一直复用旧内核。 */
-    static final int REV = 3;
+    static final int REV = 4;
 
     private final String user, key;
 
@@ -113,12 +113,19 @@ final class Kaggle {
         return best.isEmpty() ? s : best;
     }
 
-    /** hello 会回 token 与 userName，两个都拿，谁先到用谁。它说的错话不算数，见 probeOwner。 */
+    /**
+     * hello 会回 token 与 userName，两个都拿，谁先到用谁。
+     * 注意它对「怎么带凭据」比别的端点挑：同一个 Key，push 能用、hello 回 401 是常事，
+     * 所以这里绝不抛 AuthError —— 一旦抛了，后面真正干活的接口就没机会说话。
+     */
     JSONObject whoami() throws Exception {
         Res r = json(HOST + "/api/v1/hello", "GET", null);
-        if (r.code == 401 || r.code == 403) throw new Api.AuthError("hello 不认这个 Key（HTTP " + r.code + "）");
-        if (r.code >= 400) throw new Api.KaggleException("hello HTTP " + r.code);
-        return r.json();
+        if (r.code >= 400) return new JSONObject();
+        try {
+            return r.json();
+        } catch (Exception e) {
+            return new JSONObject();
+        }
     }
 
     /**
@@ -168,15 +175,20 @@ final class Kaggle {
     static String explain(String rawKey, String user, String err) {
         String k = normalizeKey(rawKey);
         String u = user == null ? "" : user.trim();
-        if (!isToken(k) && k.length() == 32) {
-            if (u.isEmpty()) return "旧式 32 位 key 要靠用户名配对，这一格填 kaggle.com/ 后面的 handle";
-            if (u.chars().anyMatch(c -> c > 127)) return "用户名里有非 ASCII 字符：" + u + " 多半是昵称，换成 handle";
-        }
-        if (err != null && err.contains("hello"))
-            return "hello 只是探测点，它不认不代表 Key 不对；真正的判断在 push/status，那两步的报错更准";
-        if (err != null && err.contains("不匹配"))
-            return "账号名和 Key 不是同一个人的：勾「KGAT_」并把用户名清空，让接口自己认";
-        return err == null ? "" : err;
+        String e = err == null ? "" : err;
+        // 两条 401 完全不是一回事，别再混成一句"鉴权没过"
+        if (e.contains("云端网关") || e.contains("网关"))
+            return "这是隧道/网关挡的，不是 Key：trycloudflare 出口 IP 轮换过，新 IP 不在白名单里；"
+                    + "点重试会重新等云端下发地址";
+        if (e.contains("hello") && !e.contains("推内核") && !e.contains("状态"))
+            return "hello 只是探测点，它不认不代表 Key 错；真正干活的是 push/status，看那两步的报错";
+        if (e.contains("推送") || e.contains("推内核") || e.contains("状态") || e.contains("Kaggle 拒绝"))
+            return "这一步是 Kaggle 本人在说话：把用户名清空、只留 KGAT_ 令牌再试；"
+                    + "还 401 就去 kaggle.com/settings 重新生成令牌";
+        if (!isToken(k) && k.length() == 32 && u.isEmpty())
+            return "旧式 32 位 key 要靠用户名配对，这一格填 kaggle.com/ 后面的 handle";
+        if (u.chars().anyMatch(c -> c > 127)) return "用户名里有非 ASCII 字符：" + u + " 多半是昵称，换成 handle";
+        return e;
     }
 
     // ---------------- 起活 ----------------
@@ -212,8 +224,9 @@ final class Kaggle {
         payload.put("isRetry", false);
         Res r = json(HOST + "/api/v1/kernels/push", "POST", payload);
         if (r.code == 401 || r.code == 403)
-            throw new Api.AuthError("推内核被拒（HTTP " + r.code + "）：Key 没权限、已失效，或账号 " + owner
-                    + " 不对（用户名可留空，留空就用 Kaggle 的 me）");
+            throw new Api.AuthError("Kaggle 拒绝推内核 · HTTP " + r.code + " · 账号 " + owner
+                    + "（这时才轮到说凭据：Key 失效 / 账号不是这个 Key 的 / 手机号没验证。"
+                    + "用户名留空就用 Kaggle 的 me）");
         if (r.code >= 400)
             throw new Api.KaggleException("push 失败 HTTP " + r.code + ": " + shortBody(r.text()) + hint(r.text()));
         return r.text();
@@ -364,6 +377,28 @@ final class Kaggle {
     }
 
     /**
+     * 拿云端文件里现成的令牌。只在「隧道通、令牌不对」时用：
+     * 服务端会把当前令牌写在 /kaggle/working/qwen_token.txt，暴露在隧道根路径下。
+     * 这样设备令牌轮换（会话交班）后手机不用等人重装 APK。
+     */
+    static String freshToken(String base, String old) {
+        if (base == null || base.isEmpty()) return "";
+        try {
+            HttpURLConnection c = (HttpURLConnection) new URL(base + "/qwen_token.txt").openConnection();
+            c.setConnectTimeout(10000);
+            c.setReadTimeout(10000);
+            c.setRequestProperty("User-Agent", "Qwen21APK/2.0");
+            if (c.getResponseCode() >= 400) return "";
+            String t = new String(Api.readBytes(c.getInputStream()), StandardCharsets.UTF_8).trim();
+            c.disconnect();
+            if (t.isEmpty() || t.length() > 200) return "";
+            return t;
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    /**
      * 端到端：起活 -> 等地址 -> 探活。返回可用的 {url, token}。
      * 每一步都上报，手机端能看到卡在哪，而不是干等一个转圈。
      */
@@ -420,9 +455,26 @@ final class Kaggle {
                         out.put("token", token);
                         out.put("owner", owner);
                         out.put("gpu", hub.optString("gpu", ""));
+                        out.put("egress", hub.optString("egress", ""));
+                        return out;
+                    }
+                    // 地址通了、令牌对不上：说明日志里那条 ready 是上一会话留下的旧令牌。
+                    // 这次探活本身已经证明隧道活着，所以把云端现在认的令牌一起交出去。
+                    String fresh = freshToken(url, token);
+                    if (!fresh.isEmpty() && !fresh.equals(token)) {
+                        Map<String, String> out = new LinkedHashMap<>();
+                        out.put("url", url);
+                        out.put("token", fresh);
+                        out.put("owner", owner);
+                        out.put("gpu", hub.optString("gpu", ""));
+                        out.put("egress", hub.optString("egress", ""));
+                        p.detail("令牌已按云端现时的重签");
                         return out;
                     }
                     p.detail("地址已下发，服务还没醒");
+                } catch (Api.AuthError ae) {
+                    // 隧道层面 401（cloudflared 白名单 / 网关）：不是 Key 的问题
+                    p.detail("云端网关回 " + ae.getMessage() + "，继续等新地址");
                 } catch (Exception e) {
                     p.detail("探活未通: " + e.getMessage());
                 }
