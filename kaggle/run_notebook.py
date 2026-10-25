@@ -75,6 +75,18 @@ try:
     url = start_tunnel(8188)
     print(f"\n>>> APK 无需任何配置，地址与令牌已随日志下发：{url}", flush=True)
 
+    # 手机是后来才连上来的，前面那些 stage 行它一条都没见过。
+    # 补一版现状，让人一打开 App 就看到"到哪一步了"，不用猜。
+    publish("stage", "serve", note=f"已就绪 · GPU {GPU_NAME_GLOBAL[0]} · 地址已下发")
+
+    # 真跑一张小图：接口通不通、INT8 权重在当前 ComfyUI 上能不能出正常图，
+    # 都在这一步给答案。跑完把结果写回日志，手机端点按钮前就知道云端是"能用"还是"能连但画不出来"。
+    stage("probe-image")
+    ok_probe = probe_image("ready", steps=6)
+    stage("serve")
+    publish("ready", "服务在线", url=url, gpu=GPU_NAME_GLOBAL[0],
+            egress=SERVE_IP[0], rev=REV, probe="ok" if ok_probe else "weak")
+
     if Mode == "run":
         stage("generate")
         wf = build_wf(PROMPT, seed=SEEDNUM, steps=STEPS, width=W, height=H, cfg=CFG,
@@ -94,7 +106,7 @@ except Exception as e:
     print(f"\n!!! 阶段 [{STAGE}] 失败: {e}", flush=True)
     traceback.print_exc()
     publish("error", STAGE, detail=str(e)[:800])
-    if STAGE in ("start-comfy", "check-nodes", "verify-crypto", "generate", "serve"):
+    if STAGE in ("start-comfy", "check-nodes", "verify-crypto", "generate", "serve", "probe-image"):
         print("\n---- comfy.log 尾部 ----", flush=True)
         print(tail_log(os.path.join(LOG_DIR, "comfy.log")), flush=True)
         print("\n---- tunnel.log 尾部 ----", flush=True)

@@ -26,8 +26,9 @@ final class Api {
         URL u = new URL(base + path);
         HttpURLConnection c = (HttpURLConnection) u.openConnection();
         c.setRequestMethod(method);
-        c.setConnectTimeout(20000);
-        c.setReadTimeout(180000);
+        // 隧道抖动时 20 秒的连接超时已经够久；再多只会让「点了没反应」更久
+        c.setConnectTimeout(12000);
+        c.setReadTimeout(60000);
         c.setRequestProperty("User-Agent", "Qwen21APK/1.0");
         if (token != null && !token.isEmpty()) c.setRequestProperty("X-QWEN-TOKEN", token);
         return c;

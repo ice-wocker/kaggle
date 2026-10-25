@@ -66,6 +66,7 @@ public class MainActivity extends Activity {
     private android.widget.CompoundButton swNsfw, swQuality;
     private String styleName = "自动";
     private byte[] lastPng;
+    private final StringBuilder logBuf = new StringBuilder();
     /** 当前请求打到的是云端（ComfyUI）还是 Kaggle：两者都回 401，但原因完全不同。 */
     private final java.util.concurrent.atomic.AtomicBoolean isCloudStep =
             new java.util.concurrent.atomic.AtomicBoolean(false);
@@ -247,6 +248,14 @@ public class MainActivity extends Activity {
         // 日志
         LinearLayout logs = Ui.panel(this);
         logs.addView(Ui.card(this, "运行日志"));
+        Button btnCopyLog = btn("复制日志");
+        btnCopyLog.setOnClickListener(v -> {
+            android.content.ClipboardManager cm =
+                    (android.content.ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+            cm.setPrimaryClip(ClipData.newPlainText("qwen21-log", tvLog.getText().toString()));
+            log("日志已复制到剪贴板");
+        });
+        Ui.add(logs, btnCopyLog, 8);
         tvLog = Ui.label(this, "就绪", 12, Ui.MUTED);
         tvLog.setTypeface(android.graphics.Typeface.MONOSPACE);
         tvLog.setMovementMethod(new ScrollingMovementMethod());
@@ -357,8 +366,36 @@ public class MainActivity extends Activity {
         });
     }
 
+    /**
+     * 打一行日志。同步写进内存与文件：手机断连、进程被杀之后还能从
+     * logcat / 文件里翻回卡在哪一步（之前点了按钮一片空白，就是因为只往
+     * 一个 TextView 里塞，后台线程抛异常时连异常都没人接）。
+     */
     private void log(String s) {
-        ui.post(() -> tvLog.setText(s + "\n" + tvLog.getText()));
+        String line = String.format(java.util.Locale.US, "%s  %s", clock(), s);
+        logBuf.append(line).append('\n');
+        if (logBuf.length() > 60000) logBuf.delete(0, logBuf.length() - 40000);
+        try {
+            java.io.FileWriter fw = new java.io.FileWriter(logFile(), true);
+            fw.write(line);
+            fw.write('\n');
+            fw.close();
+        } catch (Exception ignore) {}
+        ui.post(() -> tvLog.setText(logBuf.toString()));
+    }
+
+    private static String brief(Exception e) {
+        String m = e.getMessage() == null ? "" : e.getMessage().replace('\n', ' ');
+        return m.length() > 90 ? m.substring(0, 90) + "…" : e.getClass().getSimpleName() + " " + m;
+    }
+
+    private static String clock() {
+        return new java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US)
+                .format(new java.util.Date());
+    }
+
+    private java.io.File logFile() {
+        return new java.io.File(getFilesDir(), "run.log");
     }
 
     private void setStatus(String s, int color) {
@@ -420,20 +457,22 @@ public class MainActivity extends Activity {
         String token = sp.getString("token", "");
         if (force) log("上次被云端挡下，清掉缓存地址重新握手");
         if (!base.isEmpty()) {
+            log("① 探活缓存地址 " + base.replace("https://", "") + " …（最多 15 秒）");
             try {
                 // 缓存里的令牌可能是旧会话的：让 handshake 校准，别为了过期令牌去惊动 Kaggle
                 final String good = Kaggle.handshake(base, token);
                 if (!good.equals(token)) {
-                    log("令牌已按云端现时的校准，不用重填 Key");
+                    log("   令牌已按云端现时的校准，不用重填 Key");
                     sp.edit().putString("token", good).apply();
                 }
+                log("   云端在线，直接出图");
                 ui.post(() -> {
                     tvCloud.setText("云端在线 · " + base.replace("https://", ""));
                     setStatus("在线", Ui.ACCENT);
                 });
                 return;
             } catch (Exception e) {
-                log("旧地址失效，重新拉起云端（能连上就不用管 Key）");
+                log("   旧地址失效（" + brief(e) + "），重新拉起云端（能连上就不用管 Key）");
             }
         }
         final String key = Kaggle.normalizeKey(etKey.getText().toString());
@@ -456,7 +495,8 @@ public class MainActivity extends Activity {
             }
             @Override public boolean cancelled() { return cancelled.get(); }
         };
-        java.util.Map<String, String> got = new Kaggle(effUser, key).bringUp(key, p, 20 * 60 * 1000L);
+        log("   要等多久：首次装环境 + 17GB 权重约 10-15 分钟；已在线只是校准时通常几秒");
+        java.util.Map<String, String> got = new Kaggle(effUser, key).bringUp(key, p, 25 * 60 * 1000L);
         final String url = got.get("url"), tok = got.get("token");
         sp.edit().putString("url", url).putString("token", tok)
                 .putString("owner", got.get("owner")).putString("egress", got.get("egress")).apply();
@@ -475,13 +515,19 @@ public class MainActivity extends Activity {
         cancelled.set(false);
         btnRun.setEnabled(false);
         btnRun.setText("准备中…");
+        // 用户点下去的第一秒就要有回音：以前这里什么都不打，
+        // 只在后台线程里碰 SharedPreferences / 探活，一卡就是一分钟的空屏。
+        log("=== 点击「一键出图」 · " + clock() + " ===");
+        log("Key " + Kaggle.localHint(etKey.getText().toString())
+                + " · 缓存云端 " + (sp.getString("url", "").isEmpty() ? "无" : "有"));
         final String rawPrompt = etPrompt.getText().toString().trim();
         if (rawPrompt.isEmpty()) {
-            toastLog("任务为空");
+            log("任务为空，先写一句想要什么图");
             resetBtn();
             return;
         }
         saveKeyFields();
+        setStatus("准备中…", 0xFFE0B341);
         sp.edit().putString("prompt", rawPrompt)
                 .putString("steps", etSteps.getText().toString())
                 .putString("w", etW.getText().toString())
@@ -505,14 +551,15 @@ public class MainActivity extends Activity {
         final String neg = nsfw ? Presets.stripCensor(negRaw) : negRaw;
         final long useSeed = seed >= 0 ? seed : Math.abs(new java.util.Random().nextLong() % 1_000_000_000L);
 
-        setStatus("准备中…", 0xFFE0B341);
-        log("— 新任务 —");
-
         pool.execute(() -> {
+            final long t0 = System.currentTimeMillis();
             try {
+                log("② 任务 " + w + "x" + h + " · " + steps + " 步 · cfg " + cfg + " · " + batch + " 张"
+                        + (nsfw ? " · NSFW 开" : ""));
                 // 1) 云端：Key 换地址，已经在线就秒过
                 isCloudStep.set(false);
                 ensureCloud(rehandshake);
+                log("   云端就绪 +" + ((System.currentTimeMillis() - t0) / 1000) + "s");
                 Api a = api();
                 isCloudStep.set(true);
 
@@ -528,13 +575,13 @@ public class MainActivity extends Activity {
                 f.put("height", h);
                 f.put("nsfw", nsfw);
                 byte[] env = Crypto.packTask(f, key());
-                log("① 本地封装 " + env.length + "B · " + Crypto.hex(env).substring(0, 32) + "…");
+                log("③ 本地封装 " + env.length + "B · " + Crypto.hex(env).substring(0, 32) + "…");
                 log("参数 " + w + "x" + h + " · " + steps + " 步 · cfg " + cfg + " · seed " + useSeed
                         + (nsfw ? " · NSFW 开" : ""));
 
                 // 3) 加密提交
                 String tid = a.submitSealed(env);
-                log("② 已入队 " + tid.substring(0, 8));
+                log("④ 已入队 " + tid.substring(0, 8));
                 afterSubmit(tid, a, env);
 
             } catch (Api.AuthError e) {
@@ -561,10 +608,16 @@ public class MainActivity extends Activity {
                     if (!tip.isEmpty()) log("  诊断: " + tip);
                     resetBtn();
                 }
+            } catch (InterruptedException ie) {
+                log("已取消");
+                resetBtn();
             } catch (Exception e) {
                 setStatus("失败", 0xFFE05B5B);
-                log("出错: " + e.getMessage());
+                log("出错: " + e.getClass().getSimpleName() + (e.getMessage() == null ? "" : ": " + e.getMessage()));
+                log("把这段日志（右上「复制日志」）发到 Issue 里，能直接定位到卡住的那一步");
                 resetBtn();
+            } finally {
+                log("本次耗时 " + ((System.currentTimeMillis() - t0) / 1000) + "s");
             }
         });
     }
@@ -574,16 +627,46 @@ public class MainActivity extends Activity {
             setStatus("生成中…", 0xFFE0B341);
             btnRun.setText("生成中…");
         });
-        log("③ 等待 GPU（T4 上 1024×1024/20 步约 4 分钟）");
+        log("⑤ 已交给 GPU：T4 上 1024×1024/20 步约 4 分钟，这里会每 15 秒报一次进度");
         long t0 = System.currentTimeMillis();
         JSONObject st = null;
+        int fails = 0;
+        long nextBeat = 0;
+        String lastState = "";
+        String lastTip = "";
         while (true) {
             if (cancelled.get()) throw new InterruptedException("已取消");
-            st = a.task(tid);
+            try {
+                st = a.task(tid);
+                fails = 0;
+            } catch (Exception e) {
+                // 隧道抖动很常见，别一次读失败就把整次出图判死
+                fails++;
+                log("   轮询失败 " + fails + "/8 · " + e.getClass().getSimpleName()
+                        + (e.getMessage() == null ? "" : ": " + e.getMessage()));
+                if (fails >= 8) throw e;
+                Thread.sleep(4000);
+                continue;
+            }
             String state = st.optString("state");
+            String tip = st.optString("tip", "");
+            if (!tip.isEmpty() && !tip.equals(lastTip)) {
+                lastTip = tip;
+                log("   云端提示: " + tip);
+            }
             if ("done".equals(state)) break;
             if ("error".equals(state)) throw new IllegalStateException("云端报错: " + st.optString("detail"));
             long sec = (System.currentTimeMillis() - t0) / 1000;
+            if (!state.equals(lastState)) {
+                if (!state.isEmpty()) log("   云端状态 " + state + " · " + sec + "s");
+                lastState = state;
+            }
+            // 每 15 秒留一行：屏幕在转、日志也在动，用户才能分清"在跑"和"卡死"
+            if (sec >= nextBeat) {
+                nextBeat = sec + 15;
+                log("   生成中 " + sec + "s · " + state
+                        + (st.has("queue") ? " · 队首" + st.optInt("queue") + " 个" : ""));
+            }
             final long fs = sec;
             ui.post(() -> {
                 setStatus("生成中 " + fs + "s", 0xFFE0B341);
@@ -607,7 +690,7 @@ public class MainActivity extends Activity {
         }
         if (got.isEmpty()) throw new IllegalStateException("图片解码失败");
         final byte[] png = firstPng;
-        log("④ 出图 " + got.size() + " 张 " + got.get(0).getWidth() + "x" + got.get(0).getHeight()
+        log("⑥ 出图 " + got.size() + " 张 " + got.get(0).getWidth() + "x" + got.get(0).getHeight()
                 + " · 用时 " + st.optDouble("elapsed", 0) + "s · 信封 " + env.length + "B（全程未明文过网）");
         ui.post(() -> {
             for (int i = got.size() - 1; i >= 0; i--) results.add(0, got.get(i));

@@ -30,9 +30,9 @@ final class Kaggle {
     static final String HOST = "https://www.kaggle.com";
     static final String SLUG = "qwen-image-2-1-uncensored-int8-serve";
     /** 内核代码版本。改了 notebook 就要 +1，否则手机上旧版会一直复用旧内核。 */
-    static final int REV = 5;
+    static final int REV = 6;
     /** 与云端 qwen_setup.py 的 REV 同一份稳定令牌：云端换代码、手机没换包时也能进。 */
-    static final String DEVICE_TOKEN = "QW21-REV5";
+    static final String DEVICE_TOKEN = "QW21-REV6";
 
     private final String user, key;
 
@@ -76,7 +76,7 @@ final class Kaggle {
     /** 哪些接口已经试出「该换一种带法」，避免每次 401 都白跑一趟。 */
     private static final java.util.Set<String> AUTH_URLS = new java.util.HashSet<>();
 
-    private HttpURLConnection open(String url, String method, String[] mode) throws Exception {
+    private static HttpURLConnection open(String url, String method, String[] mode) throws Exception {
         HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
         c.setRequestMethod(method);
         c.setConnectTimeout(20000);
@@ -477,17 +477,42 @@ final class Kaggle {
         // hello 探不出名字时 owner 是 me：照样往下走，别在门口把人拦住
         p.stage("me".equals(owner) ? "账号按 Key 自动识别" : "账号 " + owner);
 
+        // 日志最多每 5 秒拉一次、内容没变就复用：首次那几个阶段每步好几分钟，
+        // 每轮都重拉 160KB 只是白等
+        long nextLogRead = 0;
+        int lastLogHash = 0;
+        JSONObject cachedHub = null;
+
         p.stage("检查云端会话");
         KernelState cur = status(owner);
         if (cur.running() || cur.queued()) {
             // 已经在跑/排着队就别再 push：push 会重启会话，等于白白再等一次冷启动
             p.stage(cur.queued() ? "会话排队中" : "会话已在运行");
         } else {
-            p.stage("启动云端 GPU 会话");
-            try {
-                push(owner, apiKey);
-            } catch (Api.KaggleException e) {
-                p.detail(e.getMessage() + "（继续读状态）");
+            // 状态不是 RUNNING 不等于没在线：status 对私有内核有时只回 COMPLETE/空。
+            // 之前这里无条件 push，每次都把已经跑起来的 ComfyUI 重启一遍——
+            // 用户看到的就是「点了按钮，十几分钟一条日志都没有」。
+            long now = System.currentTimeMillis();
+            if (now >= nextLogRead) {
+                nextLogRead = now + 5000;
+                String tail = logTail(owner, 160000);
+                if (tail.hashCode() != lastLogHash) {
+                    lastLogHash = tail.hashCode();
+                    cachedHub = parseHub(tail);
+                }
+            }
+            JSONObject hub = cachedHub;
+            String known = hub == null ? "" : hub.optString("url", "");
+            boolean verified = !known.isEmpty() && comfyUp(known);
+            p.detail(verified ? "云端还活着（" + known.replace("https://", "") + "），跳过重启"
+                    : (hub == null ? "日志里没有可用地址" : "日志里有地址但服务没应"));
+            if (!verified) {
+                p.stage("启动云端 GPU 会话");
+                try {
+                    push(owner, apiKey);
+                } catch (Api.KaggleException e) {
+                    p.detail(e.getMessage() + "（继续读状态）");
+                }
             }
         }
 
@@ -499,7 +524,16 @@ final class Kaggle {
             if (k.failed()) throw new Api.KaggleException(
                     "云端失败" + (k.failure.isEmpty() ? "(" + k.status + ")" : ": " + k.failure));
 
-            JSONObject hub = parseHub(logTail(owner, 160000));
+            long now = System.currentTimeMillis();
+            if (now >= nextLogRead) {
+                nextLogRead = now + 5000;
+                String tail = logTail(owner, 160000);
+                if (tail.hashCode() != lastLogHash) {
+                    lastLogHash = tail.hashCode();
+                    cachedHub = parseHub(tail);
+                }
+            }
+            JSONObject hub = cachedHub;
             String stage = hub == null ? "" : hub.optString("stage", "");
             if (hub != null && hub.optString("kind", "").equals("error"))
                 throw new Api.KaggleException("云端 " + stage + " 失败: " + hub.optString("detail"));
@@ -540,6 +574,24 @@ final class Kaggle {
         throw new Api.KaggleException("超时 " + (timeoutMs / 1000) + "s：云端还在准备（首次要装环境 + 下 17GB 权重）");
     }
 
+    /**
+     * 云端 ComfyUI 是否真的在应答。只探 /qwen/health 的存活位：
+     * 隧道对陌生出口 IP 会回 401，那是网关挡的，不能据此说"服务没起"。
+     */
+    static boolean comfyUp(String base) {
+        try {
+            HttpURLConnection c = (HttpURLConnection) new URL(base + "/qwen/health").openConnection();
+            c.setConnectTimeout(8000);
+            c.setReadTimeout(8000);
+            c.setRequestProperty("User-Agent", "Qwen21APK/2.0");
+            int code = c.getResponseCode();
+            c.disconnect();
+            return code >= 200 && code < 400;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
     static String humanStage(String s) {
         switch (s == null ? "" : s) {
             case "gpu": return "分配 GPU";
@@ -550,6 +602,7 @@ final class Kaggle {
             case "check-nodes": return "校验节点";
             case "verify-crypto": return "加密闭环自检";
             case "serve": return "开启公网隧道";
+            case "probe-image": return "真跑一张确认能出图";
             case "handoff": return "会话常驻中";
             case "restart-comfy": return "看门狗重启服务";
             default: return s == null || s.isEmpty() ? "云端准备中" : s;

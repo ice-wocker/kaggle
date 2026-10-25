@@ -32,6 +32,11 @@ MODELS = {
     "text_encoders": [(BASE_MODEL_REPO, "text_encoders/qwen3vl_8b_int8_convrot.safetensors")],
     "vae": [(BASE_MODEL_REPO, "vae/qwen_image_2.1_vae_bf16.safetensors")],
 }
+# 当前会话公布的隧道地址、出口 IP、GPU 名：常驻心跳要重播它们，所以放在全局
+SERVE_URL = [""]
+SERVE_IP = [""]
+GPU_NAME_GLOBAL = ["?"]
+
 UNET_NAME = "qwen-image-2.1-UC-int8_convrot.safetensors"
 CLIP_NAME = "qwen3vl_8b_int8_convrot.safetensors"
 VAE_NAME = "qwen_image_2.1_vae_bf16.safetensors"
@@ -730,7 +735,10 @@ try:
             return web.json_response({"error": "bad envelope: %s" % e}, status=400)
         wf = _build(f)
         pid = str(uuid.uuid4())
-        _TASKS[pid] = {"t0": _time.time()}
+        _TASKS[pid] = {"t0": _time.time(),
+                       "shape": "%sx%s/%s步/%s张" % (f.get("width"), f.get("height"),
+                                                     f.get("steps"), f.get("batch", 1)),
+                       "tip": ""}
         _srv.PromptServer.instance.prompt_queue.put((0, pid, wf))
         return web.json_response({"id": pid})
 
@@ -750,8 +758,17 @@ try:
         except Exception:
             hist = {}
         if not hist:
+            waited = _time.time() - info.get("t0", _time.time())
+            # 在跑却三分钟没产出，最典型的原因是 T4 显存不够、模型退回 CPU 硬算：
+            # 手机端看到的只是"转圈"，说实话比干等有用。
+            stuck = running and waited > 180 and not info.get("tip")
+            if stuck:
+                info["tip"] = "GPU 长时间无输出：16G 显存可能不够 1024x1024，试 768x768 或把张数改成 1"
             return web.json_response({"state": "running" if running else "queued",
-                                      "queue": len(cur[0]) if running else 0})
+                                      "queue": len(cur[0]) if running else 0,
+                                      "elapsed": round(waited, 1),
+                                      "shape": info.get("shape", ""),
+                                      "tip": info.get("tip", "")})
         e = hist[tid]
         st = e.get("status") or {}
         if st.get("status_str") == "error":
@@ -816,11 +833,21 @@ def wait_for_handoff(session_limit=11.5 * 3600, ticks=int(os.environ.get("QWEN21
     """
     t0 = time.time()
     n = 0
+    last_beat = 0
     while True:
         time.sleep(20)
         n += 1
         if n % 15 == 0:
             guard_alive()
+        # 心跳：每 5 分钟把地址再打一行。手机端第一次点按钮时隧道可能刚起来还没扫描到，
+        # 有这条重播就不用让人干等到下一次冷启动。
+        if time.time() - last_beat > 300:
+            last_beat = time.time()
+            try:
+                publish("ready", "服务在线", url=SERVE_URL[0], gpu=GPU_NAME_GLOBAL[0],
+                        egress=SERVE_IP[0], rev=REV, beat=int(time.time()))
+            except Exception:
+                pass
         st = _gate_state()
         if not st.get("auto", True):
             mark(f"handoff: 已被 {st.get('by', '?')} 接管，本会话退出")
@@ -975,12 +1002,13 @@ def start_tunnel(port=8188):
         exit_ip = urllib.request.urlopen("https://api.ipify.org", timeout=8).read().decode().strip()
     except Exception:
         exit_ip = ""
+    SERVE_URL[0] = url
+    SERVE_IP[0] = exit_ip
     publish("ready", "服务在线", url=url, gpu=GPU_NAME_GLOBAL[0], egress=exit_ip, rev=REV)
     mark(f"serve: 公网地址 {url}")
+    print(f"QWEN21 地址：{url}", flush=True)
     return url
 
-
-GPU_NAME_GLOBAL = ["?"]
 
 
 # ---------- ComfyUI API ----------
@@ -1112,9 +1140,56 @@ def upload_probe(tag):
     return back == data
 
 
+def probe_image(prefix="ready", steps=6):
+    """
+    真正跑一次采样，确认"出图"这条腿是通的，而不是只通了隧道和节点路由。
+
+    为什么值得花这 30 秒：int8 权重 + 某个 ComfyUI 版本对不上时，解码出来是
+    纯黑或全噪点，接口照样回"完成"，手机照样显示一张图。与其让人盯着黑图猜，
+    不如开机就自己跑一张，把亮度和像素方差写进日志。
+    """
+    w, h = 512, 512
+    wf = {
+        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": UNET_NAME, "weight_dtype": "default"}},
+        "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": CLIP_NAME, "type": "qwen_image", "device": "default"}},
+        "3": {"class_type": "VAELoader", "inputs": {"vae_name": VAE_NAME}},
+        "4": {"class_type": "TextEncodeQwenImage21",
+              "inputs": {"clip": ["2", 0], "prompt": "a red apple on a wooden table, soft daylight",
+                         "negative_prompt": "", "resolution": 1024}},
+        "5": {"class_type": "EmptyLatentImage", "inputs": {"width": w, "height": h, "batch_size": 1}},
+        "6": {"class_type": "KSampler", "inputs": {
+            "model": ["1", 0], "positive": ["4", 0], "negative": ["4", 1], "latent_image": ["5", 0],
+            "seed": 7, "steps": steps, "cfg": 1.0, "sampler_name": "euler", "scheduler": "simple",
+            "denoise": 1.0}},
+        "7": {"class_type": "VAEDecode", "inputs": {"samples": ["6", 0], "vae": ["3", 0]}},
+        "8": {"class_type": "SaveImage", "inputs": {"images": ["7", 0], "filename_prefix": prefix}},
+    }
+    r = run_wf(wf, timeout=1800, want_files=True)
+    if r.get("error"):
+        publish("error", "probe-image", detail=str(r["error"])[:600])
+        print("出图自检失败:", r["error"], flush=True)
+        return False
+    stat = {"shot": os.path.basename(r["images"][0].get("saved", "")) if r["images"] else "",
+            "elapsed": r.get("elapsed")}
+    try:
+        from PIL import Image as _I
+        import numpy as _np
+        arr = _np.asarray(_I.open(r["images"][0]["saved"]).convert("RGB")).astype("float32")
+        stat.update(bright=round(float(arr.mean()), 1), std=round(float(arr.std()), 1))
+        print("出图自检:", stat, flush=True)
+        if arr.std() < 2.0:
+            # 不 raise：图还是能出，只是可能不好看。把判断交给用户，别把整台机器判死。
+            publish("stage", "probe-image", note="图偏黑/纯色，INT8 权重可能与当前 ComfyUI 不匹配")
+            return False
+    except Exception as e:
+        print("出图自检统计失败:", e, flush=True)
+    publish("stage", "probe-image", note=json.dumps(stat, ensure_ascii=False))
+    return True
+
+
 # 设备令牌。REV 是写死的稳定值（APK 内置同一份），make_token() 是 seed 派生值。
 # 两个都认：换了云端代码而手机没换包时，旧包手上那个也能进。
-REV = 5
+REV = 6
 CLOUD_TOKENS = {"QW21-REV%d" % REV, make_token(SEED_GLOBAL)}
 
 # 令牌落盘处：self-resume 时读回上一次的进度（只在卷上，不对外暴露）
