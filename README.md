@@ -6,6 +6,9 @@ Kaggle 免费 GPU 跑 `Qwen-Image-2.1-Uncensored` 的 **INT8** 量化版，Andro
 
 *T4 上 20 步 1024×1024，236 秒。上面的图就是 `docs/run_summary.json` 里那次运行的产物。*
 
+这是**一张**的数。要看 9 张、要看这个数落在一个什么区间里，用 `kaggle/gen_batch.py`
+（见[下一节](#9-张一起跑)），它把单张墙钟记进 `docs/bench/batch.json`。
+
 ## 目录
 
 ```
@@ -109,6 +112,45 @@ cd android && ./build.sh
 只要机器上有 `javac`，SDK 缺失会自动下载到 `android/.sdk/`，产出直接覆盖 `apk/` 里那一份。
 签名用固定的 `android/.keystore`（首次自动生成），所以升级安装不会因签名变化被系统拒掉。
 
+## 9 张一起跑
+
+`docs/run_summary.json` 是 1 张的成绩：236.2 秒。单个数说服力有限——它可能是那天的
+隧道特别顺，也可能是那一张恰好简单。所以另有一个脚本，跑 9 张，每张的墙钟都留着。
+
+```bash
+# 已经知道地址（云端日志里那行 QWEN21:// 里的 url / token）
+python3 kaggle/gen_batch.py --url https://xxxx.trycloudflare.com --token QW21-xxxx
+
+# 只知道自己 push 上去的 slug：脚本自己读内核日志把地址捞出来（用你的 KGAT_ 令牌）
+python3 kaggle/gen_batch.py --wait --slug <owner>/<kernel-slug> --key KGAT_xxxx
+
+# 不出网，只验本地信封
+python3 kaggle/gen_batch.py --dry-run
+```
+
+它跟 APK 走的是同一条路：端上封信封 → `POST /qwen/generate` → 轮询 `/qwen/task` →
+`/view` 取图。**计时从封包前开始，到图片落盘为止**——这段才是用户在等的墙钟时间，
+不是云端自己报的 `elapsed`（那个不包含排队、隧道和取图）。
+
+9 张不是同一句提示词点 9 次：
+
+- 5 张是**同一句**猫（`docs/run_summary.json` 那句），只换种子——看同一份工作流换 seed
+  时耗时抖多少。同一个种子再跑一次，出的图应该逐像素一致。
+- 另外 4 张换题材（拉面摊、雪山、蜂鸟、水乡、雷暴里取），看耗时是否跟内容相关——
+  采样步数一样就该基本无关；相关的话，瓶颈就不在采样上。
+
+产物：`docs/bench/q01.png … q09.png`，外加 `batch.json`（逐张 seed / 提示词 / 秒数 / 字节数，
+以及总墙钟、单张均值和极值）。全成功退出码 0，有失败是 1，失败那张的 `error` 也会写进 `batch.json`
+——不然一张失败只会让人重跑整轮，然后忘掉它怎么挂的。
+
+**这一节现在还没有真数字。** 写这段的时候手上没有能跑 T4 的 Key，也没有 GPU：
+本机 `nvidia-smi` 不存在、`torch` 没装、`~/.kaggle` 空着。拿一张图冒充九张、
+把 236.2 抄九遍，比不写更坏——所以先留白。跑完那条命令，`batch.json` 一出来，这张表就能填：
+
+<!-- BENCH:TABLE -->
+
+图在 `docs/bench/` 里，表格按 `batch.json` 生成，别手写数字。
+
 ## 加密链路
 
 `comfy_node_crypt` 是 ComfyUI 原生 custom node，不是外挂：
@@ -172,6 +214,8 @@ python3 kaggle/verify_seal.py    # 密文 + 信封 packTask 双向校验
 ## 已知边界
 
 - **首次要等**：装环境 + 17GB 权重约 10-15 分钟，这不是 APK 能优化的部分。
+- **9 张不一定是 9×236 秒**。236 秒是走完「封包→排队→采样→取图」一整圈的墙钟，
+  连跑时哪一段被摊薄、哪一段不摊薄，只能看 `docs/bench/batch.json` 的量出来的数。
 - **单次会话上限 12 小时**：到期前云端自己 push 新版本接棒，旧会话优雅退出。
   重启后要重新下权重（这就是上面说的 /tmp 取舍换来的可靠续跑）。
 - **真 GPU 推理没在设备上端到端跑过**：设备侧验到的是
