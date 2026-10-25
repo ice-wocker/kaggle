@@ -181,3 +181,8 @@ python3 kaggle/verify_seal.py    # 密文 + 信封 packTask 双向校验
 - **模拟器无 KVM 时极慢**：本次宿主没有 `/dev/kvm`，全程 QEMU TCG 纯软件模拟，
   Android 14 冷启约 5 分钟、偶发系统级 ANR 弹窗（是 `process system` / `System UI`
   超时，不是本 App）。这台机器上的截图因此拍得比较费劲，但 App 本身进程始终存活、界面正常。
+
+**日志要能指到具体的字节。** 之前 push 失败只留一句「被拒」，日志里看不到发给谁、Kaggle 的原话是什么，
+最后还得让人把日志贴出来问。现在 push 会先记一行「push → owner/slug」，再记一行「push 回 HTTP xxx：原话」；
+`hello` 探到谁、`kernels/list` 反查回几号、读日志被拒的 HTTP 码，也都各占一行。
+账号探不到时不再静默退回 `me`：那一步会说「反查账号：kernels/list 回 HTTP 401」，一眼看出是令牌不认这个接口。

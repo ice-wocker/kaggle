@@ -70,17 +70,24 @@ final class Kaggle {
      * 凭据怎么带。Kaggle 对「旧式 key + Basic」和「KGAT_ 令牌」挑得不一样，
      * 401 时换下一个再试——总比让人回去重填一个字都没错的 Key 强。
      */
-    private String[][] authModes() {
+    private String[][] authModes(String url) {
         if (isToken(key)) {
-            return new String[][]{
+            String[][] pair = {
                     {"Authorization", "Bearer " + key},
                     {"Authorization", "Basic " + Auth.b64(user + ":" + key)},
             };
+            // 这条接口已经试出该用第二种带法：别再让它先挨一个 401
+            return learned(url) ? new String[][]{pair[1], pair[0]} : pair;
         }
-        return new String[][]{
+        String[][] pair = {
                 {"Authorization", "Basic " + Auth.b64(user + ":" + key)},
                 {"Authorization", "Bearer " + key},
         };
+        return learned(url) ? new String[][]{pair[1], pair[0]} : pair;
+    }
+
+    private static boolean learned(String url) {
+        synchronized (AUTH_URLS) { return AUTH_URLS.contains(url); }
     }
 
     /** 哪些接口已经试出「该换一种带法」，避免每次 401 都白跑一趟。 */
@@ -114,11 +121,11 @@ final class Kaggle {
     private volatile Progress current;
 
     private Res call(String url, String method, byte[] body, String ctype) throws Exception {
-        Res r = callOnce(url, method, body, ctype, authModes()[0]);
+        String[][] modes = authModes(url);
+        Res r = callOnce(url, method, body, ctype, modes[0]);
         tap(method, url, r.code);
         if (r.code == 401 || r.code == 403) {
-            String[] alt = authModes()[1];
-            Res r2 = callOnce(url, method, body, ctype, alt);
+            Res r2 = callOnce(url, method, body, ctype, modes[1]);
             tap(method + "(换带法)", url, r2.code);
             if (r2.code < 400) {
                 // 换对了：记住这条接口的带法，下次直接用
@@ -200,11 +207,16 @@ final class Kaggle {
      * 401/403/404 一律当成"探不到"，绝不再据此对人说 Key 无效。
      */
     String probeOwner() {
+        return probeOwner(null);
+    }
+
+    String probeOwner(Progress p) {
         try {
             JSONObject o = whoami();
             String u = o.optString("userName", "");
             if (blank(u)) u = o.optString("username", "");
             if (blank(u)) u = o.optString("user", "");
+            if (!blank(u) && p != null) p.detail("hello 探到账号 " + u.trim());
             return blank(u) ? "" : u.trim();
         } catch (Exception e) {
             return "";
@@ -213,7 +225,11 @@ final class Kaggle {
 
     /** 真实账号名：Key 属于谁，内核就推到谁名下。省掉一个要用户手填的字段。 */
     String resolveUser() throws Exception {
-        String u = probeOwner();
+        return resolveUser(null);
+    }
+
+    String resolveUser(Progress p) throws Exception {
+        String u = probeOwner(p);
         if (!blank(u)) return u;
         // 探不到就信用户：填了就用，没填就用 Kaggle 自己的 me
         if (!blank(user) && !"me".equals(user)) return user;
@@ -231,6 +247,7 @@ final class Kaggle {
         if (!blank(owner) && !"me".equals(owner)) return owner;
         try {
             Res r = call(HOST + "/api/v1/kernels/list", "GET", null, null);
+            if (p != null) p.detail("反查账号：kernels/list 回 HTTP " + r.code);
             if (r.code < 400) {
                 JSONArray arr = new JSONArray(r.text());
                 for (int i = 0; i < arr.length(); i++) {
@@ -312,6 +329,14 @@ final class Kaggle {
      * 一句跟语言毫无关系的抱怨，因为载荷本身它压根没读进去。
      */
     String push(String owner, String apiKey) throws Exception {
+        return push(owner, apiKey, null);
+    }
+
+    /**
+     * 带上报的那一版：每一条真发出去的请求都进日志，400 的原话也抄进日志。
+     * 以前 push 失败只留一句「被拒」，日志里看不出发给谁、发了什么、Kaggle 原话是什么。
+     */
+    String push(String owner, String apiKey, Progress p) throws Exception {
         if (blank(owner) || "me".equalsIgnoreCase(owner.trim()))
             throw new Api.AuthError("推内核需要一个真账号，现在拿到的是 “"
                     + (blank(owner) ? "空" : owner) + "”：Key 没能换出 handle。"
@@ -348,8 +373,10 @@ final class Kaggle {
         payload.put("text", "");
         payload.put("source", s);
         payload.put("isRetry", false);
+        if (p != null) p.detail("push → " + kernelRef(owner) + "（language=python · name/id 成对 · slug 内层也带）");
         Res r = json(HOST + "/api/v1/kernels/push", "POST", payload);
         pushed = r.code < 400;
+        if (p != null) p.detail("push 回 HTTP " + r.code + (r.code >= 400 ? "：Kaggle 原话「" + shortBody(r.text()) + "」" : ""));
         if (r.code == 401 || r.code == 403)
             throw new Api.AuthError("Kaggle 拒绝推内核 · HTTP " + r.code + " · 账号 " + owner
                     + "（这时才轮到说凭据：Key 失效 / 账号不是这个 Key 的 / 手机号没验证。"
@@ -434,7 +461,13 @@ final class Kaggle {
         req.put("kernelSlug", SLUG);
         req.put("pageSize", 100);
         Res r = json(MIDTIER + "/v1/kernels.KernelsApiService/ListKernelSessionOutput", "POST", req);
-        if (r.code >= 400) return "";
+        if (r.code >= 400) {
+            // 空日志和「读不到日志」是两件事：前者是云端还没开跑，后者要人去看 Key/账号
+            Progress p = current;
+            if (p != null) p.detail("读日志被拒 HTTP " + r.code + "（" + shortUrl(MIDTIER
+                    + "/v1/kernels.KernelsApiService/ListKernelSessionOutput") + "）");
+            return "";
+        }
         JSONObject o = r.json();
         String raw = o.optString("log", "");
         if (raw.isEmpty() || "null".equals(raw)) raw = o.optString("logNullable", "");
@@ -584,7 +617,7 @@ final class Kaggle {
         // 状态与日志这两步带 "me" 去问也算数（Kaggle 按 Key 认人），
         // 但 push 要拼 slug，拼成 me/<slug> 它只会回一句 400。
         // 所以下面每一步都用真账号；真拿不到就在 pushing 前停下来说清楚。
-        String owner = resolveUser();
+        String owner = resolveUser(p);
         boolean anonymous = "me".equals(owner);
         if (anonymous) {
             // 日志和状态带 me 问也算数（Kaggle 按 Key 认人）；但 push 要拼 slug，
@@ -642,13 +675,14 @@ final class Kaggle {
             if (!verified) {
                 p.stage("启动云端 GPU 会话（push 内核）");
                 try {
-                    push(owner, apiKey);
+                    push(owner, apiKey, p);
                     p.detail("push 已送达 Kaggle（" + kernelRef(owner) + "），等它排 GPU");
                 } catch (Api.AuthError e) {
                     throw e;
                 } catch (Api.KaggleException e) {
-                    p.detail("push 被拒 · " + (e.getMessage() == null ? "无正文" : e.getMessage()));
-                    p.detail("这次发的账号位是 " + kernelRef(owner) + "：400 说的那句跟语言无关，通常是账号位不对");
+                    // 「发给谁 / HTTP 码 / Kaggle 原话」push 里已经写进日志，这里只补结论
+                    p.detail("push 被拒 · 本次账号位 " + kernelRef(owner)
+                            + "（400 提到 language 时，问题在账号位或载荷结构，不在语言）");
                     throw e;
                 }
             }
