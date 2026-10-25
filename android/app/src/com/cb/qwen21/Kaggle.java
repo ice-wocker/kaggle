@@ -30,9 +30,9 @@ final class Kaggle {
     static final String HOST = "https://www.kaggle.com";
     static final String SLUG = "qwen-image-2-1-uncensored-int8-serve";
     /** 内核代码版本。改了 notebook 就要 +1，否则手机上旧版会一直复用旧内核。 */
-    static final int REV = 6;
+    static final int REV = 7;
     /** 与云端 qwen_setup.py 的 REV 同一份稳定令牌：云端换代码、手机没换包时也能进。 */
-    static final String DEVICE_TOKEN = "QW21-REV6";
+    static final String DEVICE_TOKEN = "QW21-REV7";
 
     private final String user, key;
 
@@ -489,10 +489,13 @@ final class Kaggle {
             // 已经在跑/排着队就别再 push：push 会重启会话，等于白白再等一次冷启动
             p.stage(cur.queued() ? "会话排队中" : "会话已在运行");
         } else {
+            if (cur.failed())
+                p.detail("上一轮失败: " + (cur.failure.isEmpty() ? cur.status : cur.failure));
             // 状态不是 RUNNING 不等于没在线：status 对私有内核有时只回 COMPLETE/空。
             // 之前这里无条件 push，每次都把已经跑起来的 ComfyUI 重启一遍——
             // 用户看到的就是「点了按钮，十几分钟一条日志都没有」。
             long now = System.currentTimeMillis();
+            int tailLines = -1;
             if (now >= nextLogRead) {
                 nextLogRead = now + 5000;
                 String tail = logTail(owner, 160000);
@@ -500,6 +503,7 @@ final class Kaggle {
                     lastLogHash = tail.hashCode();
                     cachedHub = parseHub(tail);
                 }
+                tailLines = tail.isEmpty() ? 0 : tail.split("\n", -1).length;
             }
             JSONObject hub = cachedHub;
             String known = hub == null ? "" : hub.optString("url", "");
@@ -517,6 +521,12 @@ final class Kaggle {
         }
 
         String lastStage = "";
+        // 上一版这段时间只打「等待云端日志 · Ns」：日志是空的、内核还没起、日志读不到，
+        // 三种情况长得一模一样，人只能一直等到 1200 秒超时。把这两件事分开显示。
+        String lastWaitNote = "";
+        // 日志一共多少行：0 和「有内容但没有 QWEN21://」是完全不同的两种卡法，
+        // 人不用去网页翻日志就能分清
+        int logLines = -1;
         while (System.currentTimeMillis() - t0 < timeoutMs) {
             if (p.cancelled()) throw new InterruptedException("已取消");
             KernelState k = status(owner);
@@ -531,6 +541,7 @@ final class Kaggle {
                 if (tail.hashCode() != lastLogHash) {
                     lastLogHash = tail.hashCode();
                     cachedHub = parseHub(tail);
+                    logLines = tail.isEmpty() ? 0 : Math.max(1, tail.split("\n", -1).length);
                 }
             }
             JSONObject hub = cachedHub;
@@ -541,7 +552,16 @@ final class Kaggle {
                 lastStage = stage;
                 p.stage(humanStage(stage) + " · " + el + "s");
             } else if (stage.isEmpty()) {
-                p.stage("等待云端日志 · " + el + "s" + (k.status.isEmpty() ? "" : " · " + k.status));
+                // 空日志 + 空状态 = push 还没被 Kaggle 接住；状态有值 = 已经在跑但还没吐进度
+                String note = "等待云端日志 · " + el + "s"
+                        + (k.status.isEmpty() ? " · 内核状态未知" : " · " + k.status)
+                        + (logLines < 0 ? "" : logLines == 0 ? " · 日志为空" : " · 日志 " + logLines + " 行");
+                if (!note.equals(lastWaitNote)) {
+                    lastWaitNote = note;
+                    p.stage(note);
+                } else {
+                    p.detail(note);
+                }
             } else {
                 p.detail(humanStage(stage) + " · " + el + "s");
             }
@@ -571,7 +591,9 @@ final class Kaggle {
             }
             Thread.sleep(6000);
         }
-        throw new Api.KaggleException("超时 " + (timeoutMs / 1000) + "s：云端还在准备（首次要装环境 + 下 17GB 权重）");
+        throw new Api.KaggleException("超时 " + (timeoutMs / 1000) + "s：云端没吐出任何进度 · "
+                + (lastLogHash == 0 ? "内核日志取不到（Kaggle 侧 push/output 没过），先去网页看这次 run 的日志"
+                : "日志有内容但没有 QWEN21:// 行，多半卡在装环境或建隧道"));
     }
 
     /**

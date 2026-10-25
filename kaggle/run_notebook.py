@@ -16,6 +16,9 @@ LIMIT_HOURS = float(os.environ.get("QWEN21_LIMIT_HOURS", "11.5"))
 
 STAGE = "init"
 STAGE_GLOBAL[0] = STAGE
+# 先举手：端上等的是 QWEN21:// 这一行，不是 print。内核刚被拉起时最先要看到的是
+# 「云朵收到了」，而不是一片空白的「等待云端日志」。
+emit()
 
 
 def stage(name):

@@ -60,6 +60,17 @@ def sh(cmd, log=None, check=False):
     return rc
 
 
+def shout(msg):
+    """只打印、不上报的进度行。
+
+    日志是端上唯一的眼睛：它只认 QWEN21:// 里的 stage。以前 _fetch 每 20 秒
+    才打一行下载进度，git clone / aiohttp 往磁盘写的那段则是彻底的哑巴，
+    手机上看到的就是「等待云端日志」一秒一秒往上加、直到 1200 秒超时。
+    这里让云端在任何长耗时动作期间都别超过一两分钟不吭声。
+    """
+    print(f"[progress] {time.strftime('%H:%M:%S')} {msg}", flush=True)
+
+
 def mark(msg):
     """进度落盘，失败后也能从产物里看出卡在哪。"""
     try:
@@ -101,6 +112,7 @@ def install():
     # Kaggle 镜像自带 torch/numpy/transformers/aiohttp/pillow/safetensors/einops，
     # 所以不做 venv、不碰 torch：自定义节点只 import numpy/torch/PIL，用系统 Python 就够。
     # 重装 torch 会拉 CUDA 轮子覆盖镜像里的匹配版本，是上次最容易炸的一环。
+    shout("clone ComfyUI")
     sh(f"git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git {COMFY}",
        log=os.path.join(LOG_DIR, "setup.log"), check=False)
     if not os.path.isdir(os.path.join(COMFY, "comfy")):
@@ -155,6 +167,7 @@ def install():
     if missing:
         mark(f"install: 补装 ComfyUI 要求里缺的 {len(missing)} 项，含 comfy-aimdo/comfy-kitchen 这类硬依赖")
         print("缺:", names, flush=True)
+        shout(f"pip 装 {len(missing)} 个包：" + " ".join(names[:8]))
         sh(f"{sys.executable} -m pip install -q --no-warn-script-location " + " ".join(missing),
            log=pip_log)
         still = [line for line in missing if not _probe(line)[1]]
@@ -192,12 +205,12 @@ def _fetch(url, dst, chunk=8 << 20):
                 if not b:
                     break
                 f.write(b); done += len(b)
-                if time.time() - last > 20:
+                if time.time() - last > 10:
                     last = time.time()
                     mb = done / 1e6
                     sp = (done - have) / 1e6 / max(time.time() - t0, 1e-6)
                     pct = f"{100*done/total:.0f}%" if total else "?"
-                    print(f"  {os.path.basename(dst)} {pct} {mb:.0f}MB @ {sp:.1f}MB/s", flush=True)
+                    shout(f"下载 {os.path.basename(dst)} {pct} {mb:.0f}MB @ {sp:.1f}MB/s")
     size = os.path.getsize(tmp)
     if total and size < total:
         raise IOError(f"不完整 {size}/{total}")
@@ -225,11 +238,13 @@ def _one(sub, repo, fn):
 def download_models():
     """三个权重并行拉：16G 串行要十几分钟，并行能把这段压掉一大半。"""
     jobs = [(sub, repo, fn) for sub, items in MODELS.items() for repo, fn in items]
+    shout(f"开始拉 {len(jobs)} 件权重（合计约 17GB，走 hf-mirror）")
     errs = []
 
     def run(job):
         try:
-            _one(*job)
+            dst = _one(*job)
+            shout(f"权重就绪 {os.path.basename(dst)}")
         except Exception as e:  # noqa: BLE001 - 汇总后统一抛
             errs.append(e)
 
@@ -264,6 +279,9 @@ def start_comfy(extra_args=""):
             return True
         except Exception:
             pass
+        # 每 30 秒说一句：这段时间最长 6 分钟没日志，端上会以为卡死
+        if i and i % 15 == 0:
+            shout(f"等 ComfyUI 起来 · {2 * i}s")
         # 进程已经死了就别再等那 6 分钟：直接把真错误报出来。
         # 上一版没这一条，ModuleNotFoundError 被埋成「启动超时」，日志里全是 alembic 噪音。
         if proc.poll() is not None:
@@ -1189,8 +1207,22 @@ def probe_image(prefix="ready", steps=6):
 
 # 设备令牌。REV 是写死的稳定值（APK 内置同一份），make_token() 是 seed 派生值。
 # 两个都认：换了云端代码而手机没换包时，旧包手上那个也能进。
-REV = 6
+REV = 7
 CLOUD_TOKENS = {"QW21-REV%d" % REV, make_token(SEED_GLOBAL)}
+
+
+def emit():
+    """立刻把当前 stage 打进日志。
+
+    端上只认 QWEN21:// 那几行。第一次举手要等第一个 mark 才发生，
+    中间的 pkg 探测、GPU 查询全是静默的——手机上就是「等待云端日志」。
+    这里把开局这一行提前发出去：不是给机器看，是给人看「云朵收到了」。
+    """
+    try:
+        publish("stage", STAGE_GLOBAL[0])
+    except Exception:
+        pass
+
 
 # 令牌落盘处：self-resume 时读回上一次的进度（只在卷上，不对外暴露）
 TOKEN_FILE = "/kaggle/working/qwen_token.txt"
