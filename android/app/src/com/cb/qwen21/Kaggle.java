@@ -67,31 +67,20 @@ final class Kaggle {
     }
 
     /**
-     * 凭据怎么带。Kaggle 对「旧式 key + Basic」和「KGAT_ 令牌」挑得不一样，
-     * 401 时换下一个再试——总比让人回去重填一个字都没错的 Key 强。
+     * 凭据怎么带。这不是可以「试出来」的东西，官方 SDK 写得死清楚：
+     * KGAT_ 令牌 = Bearer；旧式 32 位 key = Basic user:key。
+     *
+     * 这里曾经有过一套「401 就换另一种带法，换对了就记住这条接口」的机制。
+     * 它看着机灵，实际是在掩盖真正的问题：载荷结构错了、账号位错了，
+     * 换带法永远换不对，只是把一次 401 变成两次，然后回一句更难懂的话。
      */
-    private String[][] authModes(String url) {
-        if (isToken(key)) {
-            String[][] pair = {
-                    {"Authorization", "Bearer " + key},
-                    {"Authorization", "Basic " + Auth.b64(user + ":" + key)},
-            };
-            // 这条接口已经试出该用第二种带法：别再让它先挨一个 401
-            return learned(url) ? new String[][]{pair[1], pair[0]} : pair;
-        }
-        String[][] pair = {
-                {"Authorization", "Basic " + Auth.b64(user + ":" + key)},
-                {"Authorization", "Bearer " + key},
-        };
-        return learned(url) ? new String[][]{pair[1], pair[0]} : pair;
+    private static String[] mode(String url, String key, String user) {
+        if (isToken(key)) return new String[]{"Authorization", "Bearer " + key};
+        // 用户名还没探出来时 Basic 的账号位留空：Kaggle 按 key 认人。
+        // 别在这拿 "me" 当账号发——hello 自己都不认这个名字。
+        String u = blank(user) || "me".equalsIgnoreCase(user.trim()) ? "" : user.trim();
+        return new String[]{"Authorization", "Basic " + Auth.b64(u + ":" + key)};
     }
-
-    private static boolean learned(String url) {
-        synchronized (AUTH_URLS) { return AUTH_URLS.contains(url); }
-    }
-
-    /** 哪些接口已经试出「该换一种带法」，避免每次 401 都白跑一趟。 */
-    private static final java.util.Set<String> AUTH_URLS = new java.util.HashSet<>();
 
     private static HttpURLConnection open(String url, String method, String[] mode) throws Exception {
         HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
@@ -121,25 +110,13 @@ final class Kaggle {
     private volatile Progress current;
 
     private Res call(String url, String method, byte[] body, String ctype) throws Exception {
-        String[][] modes = authModes(url);
-        Res r = callOnce(url, method, body, ctype, modes[0]);
+        Res r = callOnce(url, method, body, ctype);
         tap(method, url, r.code);
-        if (r.code == 401 || r.code == 403) {
-            Res r2 = callOnce(url, method, body, ctype, modes[1]);
-            tap(method + "(换带法)", url, r2.code);
-            if (r2.code < 400) {
-                // 换对了：记住这条接口的带法，下次直接用
-                synchronized (AUTH_URLS) { AUTH_URLS.add(url); }
-                return r2;
-            }
-            // 两种带法都被拒，把"看起来更像真的"那条报出去
-            return r2;
-        }
         return r;
     }
 
-    private Res callOnce(String url, String method, byte[] body, String ctype, String[] mode) throws Exception {
-        HttpURLConnection c = open(url, method, mode);
+    private Res callOnce(String url, String method, byte[] body, String ctype) throws Exception {
+        HttpURLConnection c = open(url, method, mode(url, key, user));
         if (body != null) {
             c.setDoOutput(true);
             c.setRequestProperty("Content-Type", ctype == null ? "application/json" : ctype);
@@ -228,12 +205,18 @@ final class Kaggle {
         return resolveUser(null);
     }
 
+    /**
+     * 尽力找出真 handle。三条路，顺序就是可靠性顺序：
+     * hello 探到的 -> 用户填的 -> 内核列表里的 ownerSlug。
+     *
+     * 找不到就回空串，**不回 "me"**：me 不是一个能拼进 slug 的账号，
+     * 把它当账号往下传，最后只能换回一句 400「A language must be specified」。
+     * 调用方拿空串就该停下来说清楚缺什么，而不是硬推。
+     */
     String resolveUser(Progress p) throws Exception {
         String u = probeOwner(p);
         if (!blank(u)) return u;
-        // 探不到就信用户：填了就用，没填就用 Kaggle 自己的 me
-        if (!blank(user) && !"me".equals(user)) return user;
-        return "me";
+        return realOwner(user, p);
     }
 
     /**
@@ -244,27 +227,65 @@ final class Kaggle {
      * 三条路都空，就直说到底缺什么，而不是推个 me/ 上去换一句听不懂的 400。
      */
     String realOwner(String owner, Progress p) {
-        if (!blank(owner) && !"me".equals(owner)) return owner;
-        try {
-            Res r = call(HOST + "/api/v1/kernels/list", "GET", null, null);
-            if (p != null) p.detail("反查账号：kernels/list 回 HTTP " + r.code);
-            if (r.code < 400) {
-                JSONArray arr = new JSONArray(r.text());
-                for (int i = 0; i < arr.length(); i++) {
-                    JSONObject k = arr.optJSONObject(i);
-                    if (k == null) continue;
-                    String o = k.optString("ownerSlug", "");
-                    if (blank(o)) {
-                        JSONObject ref = k.optJSONObject("ref");
-                        if (ref != null) o = ref.optString("ownerSlug", "");
-                    }
-                    if (!blank(o) && !"null".equals(o)) {
-                        if (p != null) p.detail("账号从内核列表反查出来：" + o);
-                        return o;
-                    }
+        if (!blank(owner) && !"me".equalsIgnoreCase(owner.trim())) return owner;
+        // 两条路都问：列表里的 ownerSlug 是 Key 属于谁最直接的证据。
+        // 中间层（midtier）和 www 老路由回的东西字段不同，两个都试一遍。
+        for (String[] q : new String[][]{
+                {MIDTIER + "/v1/kernels.KernelsApiService/ListKernels", "POST", "{\"pageSize\":20}"},
+                {HOST + "/api/v1/kernels/list", "GET", null},
+        }) {
+            try {
+                byte[] body = q[2] == null ? null : q[2].getBytes(StandardCharsets.UTF_8);
+                Res r = call(q[0], q[1], body, body == null ? null : "application/json");
+                if (p != null) p.detail("反查账号：" + shortUrl(q[0]) + " 回 HTTP " + r.code);
+                if (r.code >= 400) continue;
+                String o = ownerIn(r.text());
+                if (!blank(o)) {
+                    if (p != null) p.detail("账号从内核列表反查出来：" + o);
+                    return o;
                 }
+                if (p != null) p.detail("内置列表里没有内核（新账号正常），换一条认账号的路");
+            } catch (Exception e) {
+                if (p != null) p.detail("反查账号出错：" + e.getMessage());
             }
-        } catch (Exception ignore) {
+        }
+        return "";
+    }
+
+    /**
+     * 从内核列表响应里挖出 ownerSlug。字段名在几个版本里都挪过位置：
+     * 顶层 ownerSlug、ref.ownerSlug、以及裹在 kernels/items/data 数组里，
+     * 所以不假设结构，直接把所有对象走一遍。
+     */
+    static String ownerIn(String text) {
+        try {
+            Object root = text.trim().startsWith("[") ? new JSONArray(text) : new JSONObject(text);
+            return ownerIn(root, 0);
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    private static String ownerIn(Object node, int depth) {
+        if (node == null || depth > 6) return "";
+        if (node instanceof JSONArray) {
+            JSONArray a = (JSONArray) node;
+            for (int i = 0; i < a.length(); i++) {
+                String o = ownerIn(a.opt(i), depth + 1);
+                if (!blank(o)) return o;
+            }
+            return "";
+        }
+        if (!(node instanceof JSONObject)) return "";
+        JSONObject o = (JSONObject) node;
+        for (String k : new String[]{"ownerSlug", "owner", "userName", "username"}) {
+            String v = o.optString(k, "");
+            if (!blank(v) && !"null".equals(v)) return v;
+        }
+        java.util.Iterator<String> it = o.keys();
+        while (it.hasNext()) {
+            String v = ownerIn(o.opt(it.next()), depth + 1);
+            if (!blank(v)) return v;
         }
         return "";
     }
@@ -296,8 +317,8 @@ final class Kaggle {
         if (e.contains("hello") && !e.contains("推内核") && !e.contains("状态"))
             return "hello 只是探测点，它不认不代表 Key 错；真正干活的是 push/status，看那两步的报错";
         if (e.contains("language must be specified"))
-            return "这是 push 的载荷被 Kaggle 退回来了，跟“语言”无关：先看它下面那行「本次推给 谁/什么」，"
-                    + "账号位应该是你的 handle、不是 me；用户名那格填 handle（kaggle.com/ 后面那个）就行";
+            return "这是 push 的载荷结构被 Kaggle 退回来了，跟“语言”无关。"
+                    + "现在发的是官方扁平结构；如果还看到这句，跑 kaggle/test_push_payload.py 查结构性回归";
         if (e.contains("探不出账号") || e.contains("没能换出账号"))
             return "Key 本身可能没问题（能读日志、能查状态），只是没换出 handle："
                     + "把 kaggle.com/ 后面那个 handle 填进用户名那格，Key 保持 KGAT_ 令牌原样";
@@ -324,9 +345,14 @@ final class Kaggle {
     /**
      * 后台上推。第一次会从零开 GPU 会话；之后只是把同一份代码再推一遍，复用会话。
      *
-     * owner 必须是**真账号**：push 里的 id / slug 都按 owner 拼，
-     * 拼成 "me/..." 时 Kaggle 回的是 400「A language must be specified」——
-     * 一句跟语言毫无关系的抱怨，因为载荷本身它压根没读进去。
+     * 载荷必须和 Kaggle 自己的 ApiSaveKernelRequest 一模一样：**扁平**。
+     * 这里曾经套过一层 {source:{name,id,title,code,...}} 的外壳，服务端读不到 source，
+     * 就把下一条必填项 language 报成罪魁，于是所有人都在改 language——
+     * 而 language 一直是对的。那条 `400 A language must be specified.` 从来不是语言问题。
+     *
+     * 现在只发官方认识的字段：slug / text / language / kernelType / newTitle / 三个开关，
+     * 加一个 enableGpu。多一个自造键（source、sessionEnv、name、id、code、title）
+     * 都可能让服务端把整份请求当成不完整。
      */
     String push(String owner, String apiKey) throws Exception {
         return push(owner, apiKey, null);
@@ -341,50 +367,60 @@ final class Kaggle {
             throw new Api.AuthError("推内核需要一个真账号，现在拿到的是 “"
                     + (blank(owner) ? "空" : owner) + "”：Key 没能换出 handle。"
                     + "在用户名那格填上 kaggle.com/ 后面那个 handle 再点一次");
+        JSONObject s = payload(owner);
+        if (p != null) p.detail("push → " + kernelRef(owner) + "（扁平载荷 · language=python · 无 source 外壳）");
+        // 主用 midtier 的 RPC（官方 CLI 走的就是这条），400 才退到 www 老路由。
+        Res r = null;
+        for (String url : PUSH_URLS) {
+            r = json(url, "POST", s);
+            pushed = r.code < 400;
+            if (p != null) p.detail("push 回 HTTP " + r.code + " " + shortUrl(url)
+                    + (r.code >= 400 ? "：Kaggle 原话「" + shortBody(r.text()) + "」" : ""));
+            if (r.code < 400) return r.text();
+            // 401/403 是凭据的事，换端点也没用，直接交给下面统一说
+            if (r.code == 401 || r.code == 403) break;
+            // 400 有可能是这条路由不认扁平载荷：让另一条去说
+            if (r.code != 400) break;
+        }
+        if (r == null) throw new Api.KaggleException("push 没有可用端点");
+        if (r.code == 401 || r.code == 403)
+            throw new Api.AuthError("Kaggle 拒绝推内核 · HTTP " + r.code + " · 账号 " + owner
+                    + "（这时才轮到说凭据：令牌失效 / 账号不是这个 Key 的 / 手机号没验证。"
+                    + "用户名留空时按 hello 探到的账号推，不再推 me）");
+        throw new Api.KaggleException("push 失败 HTTP " + r.code + ": " + shortBody(r.text())
+                + hint(r.text()) + "（本次推给 " + kernelRef(owner) + "）");
+    }
+
+    /**
+     * 官方 CLI 打的那一条，以及 www 上那条老路由。
+     * 前者是 kagglesdk 的 SaveKernel，后者是历史路径；两条都发同样一份扁平载荷。
+     */
+    static final String[] PUSH_URLS = {
+            MIDTIER + "/v1/kernels.KernelsApiService/SaveKernel",
+            HOST + "/api/v1/kernels/push",
+    };
+
+    /**
+     * 与 kagglesdk 的 ApiSaveKernelRequest 同形的载荷。
+     *
+     * 内核代码走 text（字符串），不是 code，也不是嵌套壳里的 code。
+     * 令牌不放在这里：sessionEnv 不是这个接口的字段，云端读 KAGGLE_API_TOKEN。
+     */
+    static JSONObject payload(String owner) throws Exception {
         JSONObject s = new JSONObject();
-        // Kaggle 的 kernel 载荷要 name 与 id 成对出现，只有 id 时它会把整个 source 当成不完整
-        s.put("name", SLUG);
-        s.put("id", kernelRef(owner));
-        s.put("title", "Qwen Image 2.1 Uncensored INT8 Serve (r" + REV + ")");
-        s.put("code", Auth.b64(Kernel.notebook()));
-        // language 顶格写一遍、slug 里再认一遍：有版本只认内层 slug.language
+        s.put("slug", owner + "/" + SLUG);
+        s.put("newTitle", "Qwen Image 2.1 Uncensored INT8 Serve");
+        s.put("text", Kernel.notebook());
         s.put("language", "python");
         s.put("kernelType", "notebook");
         s.put("isPrivate", true);
         s.put("enableGpu", true);
         s.put("enableInternet", true);
-        s.put("categoryIds", new JSONArray());
         s.put("datasetDataSources", new JSONArray());
         s.put("kernelDataSources", new JSONArray());
         s.put("competitionDataSources", new JSONArray());
-        // 密钥只以环境变量交给云端，不写进代码里，也不进日志
-        JSONObject env = new JSONObject();
-        env.put("KAGGLE_USER_SECRETS_TOKEN", apiKey);
-        s.put("sessionEnv", env);
-        JSONObject inner = new JSONObject();
-        inner.put("ownerSlug", owner);
-        inner.put("kernelSlug", SLUG);
-        inner.put("language", "python");
-        inner.put("kernelType", "notebook");
-        s.put("slug", inner);
-        JSONObject payload = new JSONObject();
-        payload.put("slug", kernelRef(owner));
-        payload.put("newTitle", "Qwen Image 2.1 Uncensored INT8 Serve");
-        payload.put("text", "");
-        payload.put("source", s);
-        payload.put("isRetry", false);
-        if (p != null) p.detail("push → " + kernelRef(owner) + "（language=python · name/id 成对 · slug 内层也带）");
-        Res r = json(HOST + "/api/v1/kernels/push", "POST", payload);
-        pushed = r.code < 400;
-        if (p != null) p.detail("push 回 HTTP " + r.code + (r.code >= 400 ? "：Kaggle 原话「" + shortBody(r.text()) + "」" : ""));
-        if (r.code == 401 || r.code == 403)
-            throw new Api.AuthError("Kaggle 拒绝推内核 · HTTP " + r.code + " · 账号 " + owner
-                    + "（这时才轮到说凭据：Key 失效 / 账号不是这个 Key 的 / 手机号没验证。"
-                    + "用户名留空就用 Kaggle 的 me）");
-        if (r.code >= 400)
-            throw new Api.KaggleException("push 失败 HTTP " + r.code + ": " + shortBody(r.text())
-                    + hint(r.text()) + "（本次推给 " + kernelRef(owner) + "）");
-        return r.text();
+        s.put("categoryIds", new JSONArray());
+        return s;
     }
 
     // ---------------- 读状态 ----------------
@@ -408,7 +444,9 @@ final class Kaggle {
      */
     KernelState status(String owner) throws Exception {
         JSONObject req = new JSONObject();
-        req.put("userName", owner);
+        // 空 owner 只在「还没探到 handle」时出现。这条是只读：Kaggle 按 Key 认人，
+        // 账号位填 me 也问得到自己名下的会话——跟 push 拼 slug 完全两回事。
+        req.put("userName", blank(owner) ? "me" : owner);
         req.put("kernelSlug", SLUG);
         Res r = json(MIDTIER + "/v1/kernels.KernelsApiService/GetKernelSessionStatus", "POST", req);
         if (r.code == 401 || r.code == 403)
@@ -457,7 +495,7 @@ final class Kaggle {
      */
     String logTail(String owner, int maxBytes) throws Exception {
         JSONObject req = new JSONObject();
-        req.put("userName", owner);
+        req.put("userName", blank(owner) ? "me" : owner);
         req.put("kernelSlug", SLUG);
         req.put("pageSize", 100);
         Res r = json(MIDTIER + "/v1/kernels.KernelsApiService/ListKernelSessionOutput", "POST", req);
@@ -511,11 +549,13 @@ final class Kaggle {
         if (b.contains("phone") || b.contains("verif")) return "（账号需要先完成手机验证）";
         if (b.contains("gpu") || b.contains("quota")) return "（GPU 额度用完，或该账号还没有 GPU 资格）";
         if (b.contains("permission") || b.contains("forbidden")) return "（这个 Key 无权 push 到该账号，检查是否属同一账号）";
-        // push 的 400 十次里有九次是「账号位没填对」：它先校验 slug 再读语言字段，
-        // slug 拼歪了就把下一条必填项（language）报成罪魁。别照着这句话去改语言。
+        // 「A language must be specified」是载荷被结构性拒掉时的回声：服务端读不到它认识的字段，
+        // 就报下一条必填项。我们做过两件事：把外层 source 壳换成官方扁平结构、把 owner 换成真 handle。
+        // 真还看到这句，说明这两条里有一条又退化了——直接指到该看的地方。
         if (b.contains("language must be specified") || b.contains("must be specified"))
-            return "（这句不是让你补语言：payload 里 language 一直是 python。它真正的意思通常是"
-                    + "账号位不对——slug 的 owner 不是真 handle（比如 me），或者载荷里缺 name/id 这一对）";
+            return "（这句是载荷结构被拒的回声，不是让你补语言——language 一直是 python。）"
+                    + "跑 python3 kaggle/test_push_payload.py 看结构是不是又退化了："
+                    + "要扁平对象、不要 source 外壳、owner 必须是真 handle";
         return "";
     }
 
@@ -614,23 +654,11 @@ final class Kaggle {
     Map<String, String> bringUp(String apiKey, Progress p, long timeoutMs) throws Exception {
         long t0 = System.currentTimeMillis();
         current = p;
-        // 状态与日志这两步带 "me" 去问也算数（Kaggle 按 Key 认人），
-        // 但 push 要拼 slug，拼成 me/<slug> 它只会回一句 400。
-        // 所以下面每一步都用真账号；真拿不到就在 pushing 前停下来说清楚。
+        // 读状态/读日志这两件事，Kaggle 是按 Key 认人的，账号位不是真 handle 也能问；
+        // 但 push 要把 owner 拼进 slug，拼成 me/<slug> 只会换回一句 400。
+        // 所以先在前面把真 handle 找出来，找不到就只探不推，把话说清楚。
         String owner = resolveUser(p);
-        boolean anonymous = "me".equals(owner);
-        if (anonymous) {
-            // 日志和状态带 me 问也算数（Kaggle 按 Key 认人）；但 push 要拼 slug，
-            // 拼成 me/<slug> 换回来的就是那句 400「A language must be specified」。
-            // 所以先把真 handle 找出来，找不到就只探不推。
-            owner = realOwner(owner, p);
-            if (!blank(owner)) {
-                anonymous = false;
-            } else {
-                p.detail("没探出账号 handle，本轮只探测不推送");
-                owner = "me";
-            }
-        }
+        boolean anonymous = blank(owner);
         p.stage("账号 " + (anonymous ? "未探到（看日志）" : owner));
 
         // 日志最多每 5 秒拉一次、内容没变就复用：首次那几个阶段每步好几分钟，
