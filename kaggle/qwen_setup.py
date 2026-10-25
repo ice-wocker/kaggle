@@ -71,6 +71,13 @@ def shout(msg):
     print(f"[progress] {time.strftime('%H:%M:%S')} {msg}", flush=True)
 
 
+# 阶段时间线：控制台要能画出"从安装到出图"这条线上的每一站。
+# 只在内存里，值很小；重启就从头记，那本来就是新会话。
+STAGE_HISTORY = []
+STAGE_HISTORY_KEYS = set()
+SERVER_START = [0.0]
+
+
 def mark(msg):
     """进度落盘，失败后也能从产物里看出卡在哪。"""
     try:
@@ -78,8 +85,26 @@ def mark(msg):
             f.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
     except Exception:
         pass
+    _remember_stage(msg)
     publish("stage", msg)
     print("[progress]", msg, flush=True)
+
+
+def stage_report():
+    """开机每一站往控制台记一笔，手机上那条阶段线就是这么来的。"""
+    if STAGE_GLOBAL[0]:
+        _remember_stage(STAGE_GLOBAL[0])
+        console_say("阶段 → %s" % STAGE_GLOBAL[0], "ok")
+
+
+def _remember_stage(name):
+    # 同名阶段重复出现（比如 serve 进出几次）只留第一次，
+    # 时间线是用来指路的，不是用来刷屏的
+    key = str(name).split(":")[0].strip()
+    if key in STAGE_HISTORY_KEYS:
+        return
+    STAGE_HISTORY_KEYS.add(key)
+    STAGE_HISTORY.append((key, int(time.time())))
 
 
 def tail_log(path, n=60):
@@ -622,6 +647,113 @@ def image_to_tensor(img):
 '''.format(fill=hex(FILL), min_side=MIN_SIDE)
 
 
+CONSOLE_HTML = """<!doctype html>
+<html lang="zh"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Qwen21 · 实时控制台</title>
+<style>
+:root{--bg:#0a0f14;--panel:#111821;--line:#1f2a36;--text:#e6edf3;--muted:#8b96a5;--acc:#4ade80;--warn:#e0b341;--err:#e05b5b}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:13px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
+.wrap{max-width:760px;margin:0 auto;padding:14px 14px 40px}
+h1{font-size:17px;margin:0 0 2px}
+.sub{color:var(--muted);font-size:11px;margin-bottom:12px;word-break:break-all}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px;margin-bottom:12px}
+.row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.dot{width:8px;height:8px;border-radius:50%;background:#6b7280;flex:none}
+.tag{color:var(--muted);font-size:11px;border:1px solid var(--line);border-radius:6px;padding:1px 6px}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+#bar{height:8px;background:#0d141b;border:1px solid var(--line);border-radius:99px;overflow:hidden;margin:10px 0 6px}
+#fill{height:100%;width:0;background:linear-gradient(90deg,#2563eb,#4ade80);transition:width .3s}
+.stages{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+.stage{font-size:11px;color:var(--muted);border:1px solid var(--line);border-radius:99px;padding:2px 8px}
+.stage.done{color:#0a0f14;background:var(--acc);border-color:var(--acc)}
+.stage.now{color:#0a0f14;background:var(--warn);border-color:var(--warn)}
+#prev{width:100%;max-width:320px;image-rendering:pixelated;border-radius:10px;border:1px solid var(--line);background:#070b0f;display:none}
+#log{height:320px;overflow:auto;background:#070b0f;border:1px solid var(--line);border-radius:10px;padding:8px;font-family:ui-monospace,Menlo,monospace;font-size:11px;white-space:pre-wrap;word-break:break-all}
+#log div{padding:1px 0;border-bottom:1px solid rgba(255,255,255,.03)}
+.t{color:#5b6673}
+.err{color:var(--err)}.warn{color:var(--warn)}.ok{color:var(--acc)}.node{color:#7dd3fc}.cloud{color:#a78bfa}
+.kv{font-size:11px;color:var(--muted)}
+</style></head><body><div class="wrap">
+<h1>Qwen-Image 2.1 · 实时控制台</h1>
+<div class="sub" id="who">连接中…</div>
+
+<div class="card">
+  <div class="row"><span class="dot" id="dot"></span><b id="stage">—</b><span class="tag" id="gpu">GPU ?</span><span class="tag" id="queue">队列 —</span></div>
+  <div id="bar"><div id="fill"></div></div>
+  <div class="kv" id="prog">空闲</div>
+  <div class="stages" id="stages"></div>
+</div>
+
+<div class="card">
+  <div class="kv" style="margin-bottom:8px">过程图（KSampler 每步的 latent，就是「生成到哪一步了」长什么样）</div>
+  <img id="prev" alt="preview">
+  <div class="kv" id="prevnote">还没有过程图</div>
+</div>
+
+<div class="card">
+  <div class="kv" style="margin-bottom:6px">运行日志（云端本机日志 + 节点事件，同一份数据 App 也在读）</div>
+  <div id="log"></div>
+</div>
+</div>
+<script>
+// 令牌从地址栏拿，页面自己不含任何秘密
+var qs = new URLSearchParams(location.search);
+var TOKEN = qs.get('token') || '';
+if (!TOKEN) document.getElementById('who').textContent = '缺令牌：地址后面加 ?token=QW21-…';
+function esc(s){return String(s).replace(/[<>&]/g,function(c){return {'<':'&lt;','>':'&gt;','&':'&amp;'}[c]})}
+function hhmmss(ts){var d=new Date(ts*1000);return ('0'+d.getHours()).slice(-2)+':'+('0'+d.getMinutes()).slice(-2)+':'+('0'+d.getSeconds()).slice(-2)}
+var lastPreview='';
+function draw(s){
+  var st=document.getElementById('stage'), fill=document.getElementById('fill');
+  st.textContent = s.stage || '—';
+  document.getElementById('gpu').textContent = 'GPU ' + (s.gpu||'?');
+  document.getElementById('dot').style.background = (s.stage==='serve'?'#4ade80':(s.task&&s.task.state==='error'?'#e05b5b':'#e0b341'));
+  document.getElementById('queue').textContent = '队列 ' + (s.queue?(s.queue.running+s.queue.pending):0);
+  document.getElementById('who').textContent = (s.url? s.url.replace('https://','') : '隧道未起') + ' · ' + (s.slug||'') + ' · rev ' + s.rev;
+  var t = s.task || {};
+  var pct = t.pct || 0;
+  fill.style.width = pct + '%';
+  var txt = '空闲';
+  if (t.state==='running') txt = '生成中 ' + (t.step||0) + '/' + (t.total||0) + ' 步 · ' + (t.elapsed||0) + 's · ' + (t.shape||'');
+  else if (t.state==='done') txt = '完成 · ' + (t.elapsed||0) + 's · ' + ((t.images||[]).length) + ' 张';
+  else if (t.state==='error') txt = '失败 · ' + (t.detail||'').slice(0,120);
+  else if (t.state==='idle') txt = '云端在「' + (s.stage||'—') + '」，还没收到任务';
+  document.getElementById('prog').textContent = txt;
+  var box=document.getElementById('stages');
+  var names=(s.stages||[]).map(function(x){return x.name});
+  var now = s.stage;
+  box.innerHTML = names.map(function(n){
+    var cls = n===now ? 'stage now' : 'stage done';
+    return '<span class="'+cls+'">'+esc(n)+'</span>';
+  }).join('') || '<span class="stage">待启动</span>';
+  var img=document.getElementById('prev'), note=document.getElementById('prevnote');
+  if (t.id && t.has_preview) {
+    var u='/qwen/preview/'+encodeURIComponent(t.id)+'?token='+encodeURIComponent(TOKEN)+'&_='+Date.now();
+    if (u!==lastPreview){ img.src=u; lastPreview=u; }
+    img.style.display='block';
+    note.textContent='第 ' + (t.step||0) + ' 步的过程图 · 采样中会脏，正常';
+  } else if (t.state==='done') {
+    img.style.display='none'; note.textContent='采样结束，过程图已清；成品在 App 的「结果」里';
+  }
+  var log=document.getElementById('log');
+  var atBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 24;
+  log.innerHTML = (s.lines||[]).map(function(l){
+    var cls = l.level==='error'?'err':(l.level==='warn'?'warn':(l.level==='ok'?'ok':(l.level==='node'?'node':(l.level==='cloud'?'cloud':''))));
+    return '<div class="'+cls+'"><span class="t">'+hhmmss(l.t)+'</span> '+esc(l.msg)+'</div>';
+  }).join('') || '<div class="t">还没有日志</div>';
+  if (atBottom) log.scrollTop = log.scrollHeight;
+}
+function tick(){
+  fetch('/qwen/console.json?token='+encodeURIComponent(TOKEN),{cache:'no-store'})
+    .then(function(r){return r.json()}).then(draw)
+    .catch(function(e){document.getElementById('prog').textContent='连不上云端：'+e;});
+}
+tick(); setInterval(tick, 1500);
+</script></body></html>"""
+
+
 CRYPT_NODE_SRC_TEMPLATE = r'''
 import base64, hashlib, json, struct, uuid
 import numpy as np
@@ -706,6 +838,21 @@ try:
     _JOBS = {}
     _TASKS = {}
 
+    # ---- 实时回显：每一步发生了什么，都从这里流出去 ----
+    # 云端报的数是「数据」，手机要的是「过程」：到第几步了、图现在长什么样。
+    # 所以三个口各管一件事——/qwen/steps 给步骤与逐节点耗时，/qwen/preview 给过程图，
+    # /qwen/console.json 给一份整景（笔记本和 App 都读它，于是两边天然同步）。
+    _LINES = []
+    _PROG = {"step": 0, "total": 0, "t0": 0.0, "last": ""}
+    _OUT = {}
+
+    def _now():
+        return round(_time.time(), 3)
+
+    def logline(msg, level="info"):
+        _LINES.append({"t": _now(), "level": level, "msg": str(msg)[:600]})
+        del _LINES[:-200]
+
     def _unpack(blob):
         key = hashlib.sha256(b"@@SEED@@").digest()
         if blob[:2] != b"\xCB\x22":
@@ -768,6 +915,122 @@ try:
     def _auth(request, body):
         return _given(request, body) in TOKENS
 
+    def _key():
+        return hashlib.sha256(b"@@SEED@@").digest()
+
+    def _decode(blob):
+        """看状态用的一条路：信封 -> 字段。和 _unpack 同一套字节，只是多了容错。"""
+        key = _key()
+        if len(blob) < 8 or blob[:2] != b"\xCB\x22":
+            raise ValueError("raw %d bytes, magic %s" % (len(blob), blob[:2].hex()))
+        n = int.from_bytes(blob[4:6], "big")
+        if n + 6 > len(blob):
+            raise ValueError("len field %d > body %d" % (n, len(blob) - 6))
+        inner = _unfeistel(blob[6:6 + n], key)
+        if inner[:2] != b"Q2":
+            raise ValueError("body magic %s" % inner[:2].hex())
+        # 裸信封（只有 CB 头 + 明文）是排错时最常见的形态，单独说一句，
+        # 免得人对着 "bad body" 猜自己 Key 填错了。
+        return inner[2:]
+
+    def _envelope_stats(blob):
+        key = _key()
+        body = _decode(blob)
+        info = {"bytes": len(blob), "header": blob[:6].hex(), "body": len(body), "fields": []}
+        # 逐字段列出来（只有名字和长度，值是密文），手机上看得见的"生成了什么"
+        i, n = 0, 0
+        while i < len(body):
+            kl = body[i]; i += 1
+            k = body[i:i + kl].decode("utf-8", "replace"); i += kl
+            vl = int.from_bytes(body[i:i + 2], "big") if i + 2 <= len(body) else 0
+            i += 3  # 2 字节长度 + 1 字节类型
+            if i + vl > len(body):
+                break
+            info["fields"].append({"k": k, "n": vl})
+            i += vl
+            n += 1
+        info["count"] = n
+        return info
+
+    @PromptServer.instance.routes.get("/qwen/console")
+    async def _qwen_console(request):
+        """笔记本里看的实时控制台。
+
+        「笔记本上的界面和 App 里的界面同步」这件事，最省事也最不容易说谎的做法是：
+        两边读同一份数据源（控制台的状态接口），各画各的。App 把这里在 WebView 里打开，
+        笔记本里也挂这一个页面，于是同一条状态、同一张预览，在两头同时长出来。
+        只给壳子：真数据得带令牌才拿得到，页面本身不含任何秘密。
+        """
+        return web.Response(content_type="text/html", headers={"Cache-Control": "no-store"},
+                            body=CONSOLE_HTML)
+
+    @PromptServer.instance.routes.get("/qwen/console.json")
+    async def _qwen_console_json(request):
+        if not _auth(request, None):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        # HTML 是常驻的，数据是现算的：控制台靠轮询这个口，不靠任何人刷新页面
+        snap = console_snapshot()
+        return web.json_response(snap, headers={"Cache-Control": "no-store"})
+
+    @PromptServer.instance.routes.post("/qwen/inspect")
+    async def _qwen_inspect(request):
+        body = await request.json()
+        if not _auth(request, body):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        try:
+            raw = base64.b64decode((body or {}).get("t") or b"")
+            return web.json_response({"ok": True, "envelope": _envelope_stats(raw)})
+        except Exception as e:
+            return web.json_response({"ok": False, "error": "%s: %s" % (type(e).__name__, e)})
+
+    @PromptServer.instance.routes.post("/qwen/decrypt")
+    async def _qwen_decrypt(request):
+        """把一个信封原样解开给持有 seed 的人看。
+
+        这是有意的：加密是为了不让人在网络上、在别人的日志里读到提示词，
+        不是为了让人连自己发了什么都看不见。终端里点「校验」就走这条路——
+        真的把字节送到云端解一遍，回显字段名与长度，假的留着冒充不了。
+        """
+        body = await request.json()
+        if not _auth(request, body):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        try:
+            raw = base64.b64decode((body or {}).get("t") or b"")
+            f = _unpack(raw)
+            return web.json_response({"ok": True, "fields": sorted(f.keys()),
+                                      "bytes": len(raw),
+                                      "steps": f.get("steps"), "shape": "%sx%s" % (f.get("width"), f.get("height"))})
+        except Exception as e:
+            return web.json_response({"ok": False, "error": "%s: %s" % (type(e).__name__, e)})
+
+    @PromptServer.instance.routes.get("/qwen/steps/{tid}")
+    async def _qwen_steps(request):
+        tid = request.match_info["tid"]
+        if not _auth(request, None):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        return web.json_response(step_report(tid))
+
+    @PromptServer.instance.routes.get("/qwen/preview/{tid}")
+    async def _qwen_preview(request):
+        """KV 探针图：KSampler 每采一步都会把当前 latent 发到本地 /view，
+        这里只把「哪个任务、第几步」认出来，再把那张小图原样转给手机。
+        采样是分块跑的，块与块之间的图会很脏——脏就脏，它本来就是过程，不是结果。
+        """
+        tid = request.match_info["tid"]
+        if not _auth(request, None):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        meta = _TASKS.get(tid) or {}
+        entry = meta.get("preview")
+        if not entry:
+            return web.json_response({"state": "none"}, headers={"Cache-Control": "no-store"})
+        q = urllib.parse.urlencode({"filename": entry["filename"], "subfolder": entry["subfolder"], "type": "temp"})
+        try:
+            with urllib.request.urlopen(COMFY_URL + "/view?" + q, timeout=15) as r:
+                data = r.read()
+        except Exception as e:
+            return web.json_response({"state": "lost", "error": str(e)[:120]}, status=200)
+        return web.Response(body=data, content_type="image/png", headers={"Cache-Control": "no-store"})
+
     @PromptServer.instance.routes.get("/qwen/health")
     async def _qwen_health(request):
         # ok 是"服务活着"（不带令牌也看得出来），auth 才是"令牌对上没有"。
@@ -776,22 +1039,61 @@ try:
         return web.json_response({"ok": True, "node": "comfy_node_crypt", "auth": ok,
                                   "queue": len(_srv.PromptServer.instance.prompt_queue.get_current_queue()[0])})
 
+    def _hook(pid):
+        """给这个任务挂上事件钩子：每采一步就记一笔，KV 探针图一到就存下来。
+
+        不做这件事，手机只能看到「queued / running / done」三个词。
+        用户要的是「到 7/20 步了，图现在是什么样」——那就得让采样器开口说话。
+        """
+        prog = {"step": 0, "total": 0, "t0": _time.time(), "last": ""}
+
+        def on_step(_node, _max, value, _sched, sigmas, denoise=1.0, **_kw):
+            prog["step"] = int(value)
+            prog["total"] = len(sigmas) if sigmas else prog["total"]
+            _TASKS.get(pid, {})["progress"] = dict(prog)
+
+        def on_preview(_node, sampled, sid, **_kw):
+            # 只留最后一张：过程图没人要历史，手机每次也只看最新
+            _TASKS.get(pid, {})["preview"] = {"filename": sid, "subfolder": "", "step": prog["step"]}
+
+        def on_done(_node, _out, _pid, **_kw):
+            # 出图落盘会把 KV 探针图清掉，这里先把「过程到此为止」记下来，
+            # 别让人对着最后那张 64x64 的噪点当结果。
+            logline("采样完成，用时 %.1fs" % (_time.time() - prog["t0"]), "ok")
+
+        # 三个钩子的签名随 ComfyUI 版本变过，所以一个一个挂：
+        # 挂不上就少一路回显，绝不因为回显把出图搞挂。
+        pr = _srv.PromptServer.instance
+        for name, fn in (("add_on_progress_cb", on_step), ("add_on_preview_cb", on_preview),
+                         ("add_on_executed_cb", on_done)):
+            try:
+                getattr(pr, name)(fn)
+            except Exception as e:
+                logline("回显钩子 %s 挂不上：%s（照样出图，只是少了这一路）" % (name, e), "warn")
+
     @PromptServer.instance.routes.post("/qwen/generate")
     async def _qwen_generate(request):
         body = await request.json()
         if not _auth(request, body):
+            logline("拒绝：令牌对不上（长度 %d）" % len(_given(request, body)), "warn")
             return web.json_response({"error": "unauthorized", "got": len(_given(request, body))}, status=401)
         raw = base64.b64decode(body.get("t") or b"")
         try:
             f = _unpack(raw)
         except Exception as e:
+            logline("信封解不开：%s" % e, "error")
             return web.json_response({"error": "bad envelope: %s" % e}, status=400)
         wf = _build(f)
         pid = str(uuid.uuid4())
         _TASKS[pid] = {"t0": _time.time(),
                        "shape": "%sx%s/%s步/%s张" % (f.get("width"), f.get("height"),
                                                      f.get("steps"), f.get("batch", 1)),
+                       "progress": {"step": 0, "total": int(f.get("steps", 20)), "t0": _time.time()},
                        "tip": ""}
+        # 只记形状，不记提示词：解密后的字只活在内存里，日志里也不留。
+        logline("任务 %s · %s · seed %s · 信封 %d 字节"
+                % (pid[:8], _TASKS[pid]["shape"], f.get("seed"), len(raw)))
+        _hook(pid)
         _srv.PromptServer.instance.prompt_queue.put((0, pid, wf))
         return web.json_response({"id": pid})
 
@@ -1086,6 +1388,7 @@ def start_tunnel(port=8188):
     except Exception:
         exit_ip = ""
     SERVE_URL[0] = url
+    SERVER_START[0] = SERVER_START[0] or time.time()
     SERVE_IP[0] = exit_ip
     publish("ready", "服务在线", url=url, gpu=GPU_NAME_GLOBAL[0], egress=exit_ip, rev=REV)
     mark(f"serve: 公网地址 {url}")
@@ -1221,6 +1524,118 @@ def upload_probe(tag):
         back = r.read()
     print("upload probe:", info, "bytes back:", len(back), "match:", back == data, flush=True)
     return back == data
+
+
+def console_say(msg, level="info"):
+    """把一段话写进控制台时间线。进度、下载、隧道都从这里说话。"""
+    try:
+        import importlib
+        mod = importlib.import_module("custom_nodes.comfy_node_crypt")
+        mod.logline(msg, level)
+    except Exception:
+        pass
+
+
+# ---------- 实时回显：一份给手机、也给笔记本控制台看的「整景」 ----------
+# 两处界面读同一份数据，才是真同步；各自算各自的，迟早说的不是一件事。
+def _lines_from_log():
+    """云端进程自己的日志（pip / 下载 / ComfyUI 启动）也属于「过程」。
+
+    手机上的终端要能看到 17GB 下到哪儿了，而不是转着圈猜。这些行本来写在
+    logs/*.log 里，顺手 tail 回来，和节点的日志合并成一条时间线。
+    """
+    out = []
+    for name in ("pip.log", "setup.log", "download.log", "comfy.log", "tunnel.log"):
+        p = os.path.join(LOG_DIR, name)
+        try:
+            if not os.path.exists(p):
+                continue
+            with open(p, "rb") as f:
+                f.seek(max(0, os.path.getsize(p) - 6000))
+                raw = f.read().decode("utf-8", "replace").splitlines()
+        except Exception:
+            continue
+        for ln in raw[-8:]:
+            ln = ln.strip()
+            if not ln:
+                continue
+            out.append({"t": round(os.path.getmtime(p), 3), "level": "cloud", "src": name, "msg": ln[:400]})
+    return out
+
+
+def console_snapshot():
+    """当前这一刻的全部真相：阶段、GPU、隧道、队列、进度、最近日志。"""
+    snap = {"rev": REV, "ts": int(time.time()), "stage": STAGE_GLOBAL[0],
+            "gpu": GPU_NAME_GLOBAL[0], "slug": KERNEL_SLUG,
+            "url": SERVE_URL[0], "egress": SERVE_IP[0],
+            "server": SERVER_START[0] and round(time.time() - SERVER_START[0], 1),
+            "stages": [{"name": n, "t": t} for n, t in STAGE_HISTORY[-40:]],
+            "task": None, "lines": []}
+    try:
+        from server import PromptServer
+        q = PromptServer.instance.prompt_queue
+        cur = q.get_current_queue()
+        snap["queue"] = {"running": len(cur[0]), "pending": len(cur[1])}
+    except Exception:
+        snap["queue"] = {"running": 0, "pending": 0}
+    try:
+        snap["task"] = step_report(None)
+    except Exception as e:
+        snap["task"] = {"state": "unknown", "error": str(e)[:200]}
+    lines = list(_LINES[-120:]) + _lines_from_log()
+    lines.sort(key=lambda x: x.get("t") or 0)
+    snap["lines"] = lines[-140:]
+    return snap
+
+
+def step_report(tid=None):
+    """单个任务的进度：第几步 / 共几步 / 每个节点花了多久 / 有没有过程图。
+
+    tid 为空时给「最近那个任务」——手机没人告诉它 id 也想知道云端在忙什么。
+    """
+    try:
+        import importlib
+        mod = importlib.import_module("custom_nodes.comfy_node_crypt")
+    except Exception:
+        mod = None
+    tasks = getattr(mod, "_TASKS", None)
+    if not tasks:
+        # 还没有手机来过：阶段推进本身也是进度，别让控制台一直空白
+        return {"state": "idle", "step": 0, "total": 0, "stage": STAGE_GLOBAL[0]}
+    if tid is None:
+        tid = max(tasks.items(), key=lambda kv: kv[1].get("t0", 0))[0]
+    info = tasks.get(tid) or {}
+    if not info:
+        return {"state": "unknown", "id": tid, "step": 0, "total": 0}
+    prog = info.get("progress") or {}
+    out = {"id": tid, "state": "running", "shape": info.get("shape", ""),
+           "step": int(prog.get("step", 0)), "total": int(prog.get("total", 0) or 0),
+           "elapsed": round(time.time() - info.get("t0", time.time()), 1),
+           "has_preview": bool(info.get("preview")), "tip": info.get("tip", "")}
+    total, step = out["total"], out["step"]
+    out["pct"] = round(100.0 * min(step, total) / total, 1) if total else 0.0
+    try:
+        hist = _history(tid)
+    except Exception:
+        hist = {}
+    if hist:
+        st = hist.get("status") or {}
+        if st.get("status_str") == "error":
+            out["state"] = "error"
+            out["detail"] = str(st.get("messages"))[-600:]
+        else:
+            out["state"] = "done"
+            out["images"] = [{"filename": im.get("filename"), "subfolder": im.get("subfolder", ""),
+                              "type": im.get("type", "output")}
+                             for _n, o in (hist.get("outputs") or {}).items()
+                             for im in o.get("images", [])]
+            out["pct"] = 100.0
+    return out
+
+
+def _history(tid):
+    from server import PromptServer
+    return PromptServer.instance.prompt_queue.get_history(tid)
 
 
 def probe_image(prefix="ready", steps=6):

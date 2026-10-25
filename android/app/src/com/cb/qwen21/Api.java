@@ -169,6 +169,40 @@ final class Api {
         return new JSONObject(get("/qwen/task/" + enc(id)));
     }
 
+    /** 整景快照：阶段、队列、进度、日志。与笔记本里那个控制台读的是同一个口。 */
+    String consoleJson() throws Exception {
+        return get("/qwen/console.json");
+    }
+
+    /** 逐节点进度：第几步 / 共几步 / 每步耗时。老云端没有这个口，抛异常即可。 */
+    JSONObject steps(String id) throws Exception {
+        return new JSONObject(get("/qwen/steps/" + enc(id)));
+    }
+
+    /** 采样中的 latent 缩略图。还没出过程图时云端回 JSON，这里返回 null。 */
+    byte[] preview(String id) throws Exception {
+        HttpURLConnection c = open("/qwen/preview/" + enc(id), "GET");
+        c.setReadTimeout(20000);
+        int code = c.getResponseCode();
+        String type = c.getContentType() == null ? "" : c.getContentType();
+        if (code == 401 || code == 403) throw new AuthError("HTTP " + code);
+        if (code >= 400 || !type.startsWith("image/")) {
+            c.disconnect();
+            return null;
+        }
+        byte[] b = readBytes(c.getInputStream());
+        c.disconnect();
+        return b;
+    }
+
+    /** 把信封原样送去云端解一遍：字段名与长度都回显，端上据此显示「生成了什么、云端认不认」。 */
+    JSONObject decryptEcho(byte[] envelope) throws Exception {
+        JSONObject req = new JSONObject();
+        req.put("t", android.util.Base64.encodeToString(envelope, android.util.Base64.NO_WRAP));
+        req.put("k", token == null ? "" : token);
+        return new JSONObject(postJson("/qwen/decrypt", req));
+    }
+
     interface Progress {
         void tick(long sec) throws Exception;
         boolean cancelled();

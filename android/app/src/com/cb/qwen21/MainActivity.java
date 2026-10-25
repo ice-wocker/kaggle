@@ -60,8 +60,26 @@ public class MainActivity extends Activity {
     private int keyMode = 0;
     private TextView tvStatus, tvLog, tvTaskHex, tvPromptPreview, tvCloud;
     private LinearLayout gallery, statusDot;
+
+    // ---- 终端：输 Key 之后直接进「创建」，边生成边看 ----
+    /** 三页：连接 / 创建 / 终端。终端是流式回显，创建页是那一屏参数 + 生成按钮。 */
+    private LinearLayout pageConnect, pageCreate, pageTerminal;
+    private TextView tvSteps, tvStageLine, tvPreviewNote, tvTermHead, tvEnvelope, tvTapHint;
+    private LinearLayout stageChips;
+    private ImageView termPreview;
+    private android.widget.ProgressBar progBar;
+    private android.webkit.WebView mirror;
+    private Button btnTermPreview, btnTermMirror, btnTermCloud;
+    private boolean mirrorMode = true;      // 终端里默认显示云端那个页面（与笔记本同一份）
+    private boolean termPreviewMode = false; // 或本地直连 /qwen/preview 的过程图
+    private String liveTaskId = "";
+    private long liveT0 = 0;
+    private int liveShown = 0;
+    /** 终端那条流是否在跑：进终端页开，销毁时关。 */
+    private final java.util.concurrent.atomic.AtomicBoolean liveOn =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
     private ImageView preview;
-    private Button btnRun, btnStyle, btnSave, btnBatch;
+    private Button btnRun, btnStyle, btnSave, btnBatch, btnEnter;
     private int batch = 1;
     private android.widget.CompoundButton swNsfw, swQuality;
     private String styleName = "自动";
@@ -83,6 +101,13 @@ public class MainActivity extends Activity {
     }
 
     // ---------------- UI ----------------
+    /**
+     * 一屏三页：连接 → 创建 → 终端。
+     *
+     * 之前是一整条长滚动条，参数、结果、日志摞在一起，手机上要滑半天才知道
+     * 「现在在干什么」。终端本该是「一眼看到它在动」，所以拆成页：
+     * 填 Key 的那一页填完就走，创建页一屏装下所有能调的，终端页只留过程。
+     */
     private View buildUi() {
         ScrollView scroll = new ScrollView(this);
         scroll.setBackgroundColor(Ui.BG);
@@ -93,7 +118,7 @@ public class MainActivity extends Activity {
 
         // Header
         LinearLayout head = Ui.column(this);
-        TextView title = Ui.label(this, "Qwen-Image 2.1 · 一键出图", 22, Ui.TEXT);
+        TextView title = Ui.label(this, "Qwen-Image 2.1 · 终端", 22, Ui.TEXT);
         title.setTypeface(null, android.graphics.Typeface.BOLD);
         head.addView(title);
         LinearLayout dotRow = new LinearLayout(this);
@@ -110,16 +135,32 @@ public class MainActivity extends Activity {
         slp.leftMargin = Ui.dp(this, 8);
         dotRow.addView(tvStatus, slp);
         Ui.add(head, dotRow, 6);
-        TextView sub = Ui.label(this, "装好填地址即用 · 云端 T4 全程免跑脚本", 12, Ui.MUTED);
+        TextView sub = Ui.label(this, "填 Key 直接进创建 · 全过程实时回显 · 与笔记本同一份数据", 12, Ui.MUTED);
         Ui.add(head, sub, 4);
         Ui.add(root, head, 0);
 
-        // ① 只需一个 Key
+        pageConnect = Ui.column(this);
+        pageCreate = Ui.column(this);
+        pageTerminal = Ui.column(this);
+        Ui.add(root, pageConnect, 14);
+        Ui.add(root, pageCreate, 14);
+        Ui.add(root, pageTerminal, 14);
+
+        buildConnectPage();
+        buildCreatePage();
+        buildTerminalPage();
+
+        // 有 Key 就是老用户：开机直接落在创建页，不再让人多按一次
+        showPage(!Kaggle.normalizeKey(sp.getString("key", "")).isEmpty());
+        return scroll;
+    }
+
+    // ---- 页 ① 连接 ----
+    private void buildConnectPage() {
         LinearLayout conn = Ui.panel(this);
         conn.addView(Ui.card(this, "① 一个 Key，剩下全自动"));
-        TextView tip = Ui.label(this, "Key 只存在本机，仅发给 kaggle.com 与你自己启动的那台 GPU。"
-                + "首次约 10-15 分钟（装环境 + 下 17GB INT8 权重），之后每次开 App 秒连。", 11, Ui.MUTED);
-        Ui.add(conn, tip, 6);
+        Ui.add(conn, Ui.label(this, "Key 只存在本机，仅发给 kaggle.com 与你自己启动的那台 GPU。"
+                + "粘完点「进入」——不用起脚本、不用传内核，云端会自己到位。", 11, Ui.MUTED), 6);
         etUser = Ui.input(this, "Kaggle 用户名（可留空；填就填 kaggle.com/ 后那个 handle，不是昵称）",
                 sp.getString("user", ""), false);
         Ui.add(conn, etUser, 10);
@@ -130,16 +171,34 @@ public class MainActivity extends Activity {
         Ui.add(conn, btnKeyMode, 8);
         tvCloud = Ui.label(this, "云端未启动", 12, Ui.MUTED);
         Ui.add(conn, tvCloud, 10);
-        Ui.add(root, conn, 14);
+        btnEnter = new Button(this);
+        btnEnter.setText("进入 →");
+        btnEnter.setTextSize(17);
+        btnEnter.setTextColor(0xFF07100E);
+        btnEnter.setAllCaps(false);
+        btnEnter.setBackground(Ui.rounded(this, Ui.ACCENT, 14, 0));
+        btnEnter.setOnClickListener(v -> enterCreate());
+        Ui.add(conn, btnEnter, 14);
+        Ui.add(pageConnect, conn, 0);
+    }
 
-        // 任务面板
+    // ---- 页 ② 创建 ----
+    private void buildCreatePage() {
         LinearLayout task = Ui.panel(this);
-        task.addView(Ui.card(this, "② 输入任务"));
+        LinearLayout titleRow = new LinearLayout(this);
+        titleRow.setOrientation(LinearLayout.HORIZONTAL);
+        titleRow.setGravity(Gravity.CENTER_VERTICAL);
+        titleRow.addView(Ui.card(this, "② 创建"),
+                new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        Button btnBack = btn("换 Key");
+        btnBack.setOnClickListener(v -> showPage(false));
+        titleRow.addView(btnBack);
+        task.addView(titleRow);
+
         etPrompt = Ui.input(this, "想要什么图？一句中文也行",
                 sp.getString("prompt", D_PROMPT), true);
         Ui.add(task, etPrompt, 10);
 
-        // 风格 + NSFW + 自动补词
         LinearLayout optRow = new LinearLayout(this);
         optRow.setOrientation(LinearLayout.HORIZONTAL);
         optRow.setGravity(Gravity.CENTER_VERTICAL);
@@ -208,7 +267,7 @@ public class MainActivity extends Activity {
         });
 
         btnRun = new Button(this);
-        btnRun.setText("一键出图");
+        btnRun.setText("开始生成 →");
         btnRun.setTextSize(17);
         btnRun.setTextColor(0xFF07100E);
         btnRun.setAllCaps(false);
@@ -218,36 +277,98 @@ public class MainActivity extends Activity {
             generate();
         });
         Ui.add(task, btnRun, 14);
-        Ui.add(root, task, 14);
 
-        // 结果
-        LinearLayout res = Ui.panel(this);
-        res.addView(Ui.card(this, "③ 结果"));
-        LinearLayout batchRow = new LinearLayout(this);
-        batchRow.setOrientation(LinearLayout.HORIZONTAL);
-        batchRow.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout res = new LinearLayout(this);
+        res.setOrientation(LinearLayout.HORIZONTAL);
+        res.setGravity(Gravity.CENTER_VERTICAL);
         btnBatch = btn("一次 " + batch + " 张");
         btnBatch.setOnClickListener(v -> pickBatch());
-        batchRow.addView(btnBatch, new LinearLayout.LayoutParams(0,
+        res.addView(btnBatch, new LinearLayout.LayoutParams(0,
                 ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-        Ui.add(res, batchRow, 10);
+        btnSave = btn("保存到相册");
+        btnSave.setOnClickListener(v -> saveToGallery());
+        LinearLayout.LayoutParams sp2 = new LinearLayout.LayoutParams(0,
+                ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+        sp2.leftMargin = Ui.dp(this, 8);
+        res.addView(btnSave, sp2);
+        Ui.add(task, res, 10);
 
         preview = new ImageView(this);
         preview.setAdjustViewBounds(true);
         preview.setScaleType(ImageView.ScaleType.FIT_CENTER);
         preview.setBackground(Ui.rounded(this, 0xFF0B0F14, 12, Ui.LINE));
         preview.setMinimumHeight(Ui.dp(this, 200));
-        Ui.add(res, preview, 10);
-        btnSave = btn("保存到相册");
-        btnSave.setOnClickListener(v -> saveToGallery());
-        Ui.add(res, btnSave, 8);
+        Ui.add(task, preview, 10);
         gallery = Ui.column(this);
-        Ui.add(res, gallery, 10);
-        Ui.add(root, res, 14);
+        Ui.add(task, gallery, 10);
+        Ui.add(pageCreate, task, 0);
+    }
 
-        // 日志
-        LinearLayout logs = Ui.panel(this);
-        logs.addView(Ui.card(this, "运行日志"));
+    // ---- 页 ③ 终端 ----
+    private void buildTerminalPage() {
+        LinearLayout term = Ui.panel(this);
+        LinearLayout headRow = new LinearLayout(this);
+        headRow.setOrientation(LinearLayout.HORIZONTAL);
+        headRow.setGravity(Gravity.CENTER_VERTICAL);
+        tvTermHead = Ui.label(this, "③ 终端 · 等待任务", 15, Ui.TEXT);
+        tvTermHead.setTypeface(null, android.graphics.Typeface.BOLD);
+        headRow.addView(tvTermHead, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        Button btnNew = btn("＋ 新建");
+        btnNew.setOnClickListener(v -> showPage(true));
+        headRow.addView(btnNew);
+        term.addView(headRow);
+
+        // 阶段芯片：和笔记本里那张控制台是同一份 stages 数据
+        stageChips = Ui.column(this);
+        Ui.add(term, stageChips, 8);
+        tvStageLine = Ui.label(this, "阶段 —", 11, Ui.MUTED);
+        Ui.add(term, tvStageLine, 6);
+
+        progBar = new android.widget.ProgressBar(this, null,
+                android.R.attr.progressBarStyleHorizontal);
+        progBar.setMax(1000);
+        Ui.add(term, progBar, 8);
+        tvSteps = Ui.label(this, "等待云端回话…", 12, Ui.TEXT);
+        tvSteps.setTypeface(android.graphics.Typeface.MONOSPACE);
+        Ui.add(term, tvSteps, 6);
+        tvTapHint = Ui.label(this, "照常滑屏；点一下过程图可在「云端控制台 / 过程图」之间切换", 10, Ui.MUTED);
+        Ui.add(term, tvTapHint, 4);
+
+        termPreview = new ImageView(this);
+        termPreview.setAdjustViewBounds(true);
+        termPreview.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        termPreview.setBackground(Ui.rounded(this, 0xFF0B0F14, 12, Ui.LINE));
+        termPreview.setMinimumHeight(Ui.dp(this, 180));
+        termPreview.setOnClickListener(v -> toggleTermView());
+        Ui.add(term, termPreview, 8);
+        tvPreviewNote = Ui.label(this, "过程图还没有（云端每采一步会推一张）", 11, Ui.MUTED);
+        Ui.add(term, tvPreviewNote, 6);
+
+        LinearLayout viewRow = new LinearLayout(this);
+        viewRow.setOrientation(LinearLayout.HORIZONTAL);
+        btnTermCloud = btn("控制台");
+        btnTermCloud.setOnClickListener(v -> { termPreviewMode = false; toggleTermView(); });
+        btnTermPreview = btn("过程图");
+        btnTermPreview.setOnClickListener(v -> { termPreviewMode = true; toggleTermView(); });
+        LinearLayout.LayoutParams bp = new LinearLayout.LayoutParams(0,
+                ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+        bp.rightMargin = Ui.dp(this, 8);
+        viewRow.addView(btnTermCloud, bp);
+        viewRow.addView(btnTermPreview, new LinearLayout.LayoutParams(0,
+                ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        Ui.add(term, viewRow, 8);
+
+        // 云端那个页面（笔记本里开的是同一个）：两边读同一份数据，所以同步是天然的
+        mirror = new android.webkit.WebView(this);
+        mirror.getSettings().setJavaScriptEnabled(true);
+        mirror.getSettings().setDomStorageEnabled(true);
+        mirror.setBackgroundColor(0xFF070B0F);
+        mirror.setLayoutParams(new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, Ui.dp(this, 420)));
+        mirror.setVisibility(View.GONE);
+        Ui.add(term, mirror, 8);
+
+        Ui.add(term, Ui.label(this, "日志", 12, Ui.MUTED), 12);
         Button btnCopyLog = btn("复制日志");
         btnCopyLog.setOnClickListener(v -> {
             android.content.ClipboardManager cm =
@@ -255,14 +376,73 @@ public class MainActivity extends Activity {
             cm.setPrimaryClip(ClipData.newPlainText("qwen21-log", tvLog.getText().toString()));
             log("日志已复制到剪贴板");
         });
-        Ui.add(logs, btnCopyLog, 8);
+        Ui.add(term, btnCopyLog, 6);
         tvLog = Ui.label(this, "就绪", 12, Ui.MUTED);
         tvLog.setTypeface(android.graphics.Typeface.MONOSPACE);
         tvLog.setMovementMethod(new ScrollingMovementMethod());
-        Ui.add(logs, tvLog, 8);
-        Ui.add(root, logs, 14);
+        Ui.add(term, tvLog, 6);
+        tvEnvelope = Ui.label(this, "", 10, Ui.MUTED);
+        tvEnvelope.setTypeface(android.graphics.Typeface.MONOSPACE);
+        Ui.add(term, tvEnvelope, 8);
+        Ui.add(pageTerminal, term, 0);
+    }
 
-        return scroll;
+    /** 页切换。终端页不显示时把 WebView 停掉，别在后台空转烧电。 */
+    private void showPage(boolean create) {
+        pageConnect.setVisibility(create ? View.GONE : View.VISIBLE);
+        pageCreate.setVisibility(create ? View.VISIBLE : View.GONE);
+        pageTerminal.setVisibility(create ? View.GONE : View.VISIBLE);
+        if (create && mirror != null) mirror.setVisibility(View.GONE);
+        if (!create) {
+            attachMirror();
+            applyTermView();
+        }
+    }
+
+    /** 终端里切「云端控制台 / 过程图」：一个是整体镜像，一个是原生直连。 */
+    private void toggleTermView() {
+        termPreviewMode = !termPreviewMode;
+        applyTermView();
+    }
+
+    private void applyTermView() {
+        if (mirror == null) return;
+        mirrorMode = !termPreviewMode;
+        mirror.setVisibility(mirrorMode ? View.VISIBLE : View.GONE);
+        termPreview.setVisibility(mirrorMode ? View.GONE : View.VISIBLE);
+        tvPreviewNote.setVisibility(mirrorMode ? View.GONE : View.VISIBLE);
+        btnTermCloud.setBackground(Ui.rounded(this, mirrorMode ? Ui.ACCENT : 0xFF1F2732, 12, Ui.LINE));
+        btnTermCloud.setTextColor(mirrorMode ? 0xFF07100E : Ui.TEXT);
+        btnTermPreview.setBackground(Ui.rounded(this, mirrorMode ? 0xFF1F2732 : Ui.ACCENT, 12, Ui.LINE));
+        btnTermPreview.setTextColor(mirrorMode ? Ui.TEXT : 0xFF07100E);
+        if (mirrorMode) attachMirror();
+    }
+
+    /**
+     * 把云端控制台塞进 WebView。地址与令牌每次都从 sp 现取：
+     * 会话交班后隧道域名会变，硬编码一次就永久白屏。
+     */
+    private void attachMirror() {
+        final String base = sp.getString("url", "");
+        final String tok = sp.getString("token", "");
+        if (base.isEmpty() || tok.isEmpty()) {
+            tvPreviewNote.setVisibility(View.VISIBLE);
+            tvPreviewNote.setText("云端还没起来，起来后这里会自己接上");
+            if (mirror != null) mirror.setVisibility(View.GONE);
+            return;
+        }
+        if (mirrorMode) {
+            String want = base + "/qwen/console?token=" + Api.enc(tok);
+            if (!want.equals(mirror.getTag())) {
+                mirror.setTag(want);
+                mirror.loadUrl(want);
+                tvPreviewNote.setVisibility(View.VISIBLE);
+                tvPreviewNote.setText("云端控制台 · " + base.replace("https://", "")
+                        + "（笔记本里开的是同一个页面）");
+            }
+            mirror.setVisibility(View.VISIBLE);
+            termPreview.setVisibility(View.GONE);
+        }
     }
 
     private LinearLayout wrapField(String name, EditText e) {
@@ -295,6 +475,155 @@ public class MainActivity extends Activity {
         return Crypto.key(SEED);
     }
 
+    /**
+     * 「输 Key 之后直接进创建界面」。
+     *
+     * 有 Key 就立刻翻页——不要让人对着一个按钮等云端握手三十秒，
+     * 那一步的消息本来就是终端该说的事：翻过去，终端里一行一行冒出来。
+     */
+    private void enterCreate() {
+        saveKeyFields();
+        String k = Kaggle.normalizeKey(etKey.getText().toString());
+        if (k.isEmpty()) {
+            log("先填 Kaggle API Key（KGAT_ 开头那个令牌，粘 export 整行也行）");
+            setStatus("缺 Key", 0xFFE05B5B);
+            return;
+        }
+        showPage(true);
+        setStatus("已进入", Ui.ACCENT);
+        log("Key " + Kaggle.localHint(k));
+        log("布局就绪：左创建、右终端（竖屏是上下两段）");
+        liveReset();
+        // 缓存里还有地址就先探一下：通的话连「拉起云端」这一步都省掉
+        pool.execute(() -> {
+            String base = sp.getString("url", "");
+            if (!base.isEmpty() && Kaggle.alive(base, sp.getString("token", ""))) {
+                log("云端在线 · " + base.replace("https://", ""));
+                ui.post(() -> {
+                    tvCloud.setText("云端在线 · " + base.replace("https://", ""));
+                    setStatus("在线", Ui.ACCENT);
+                    attachMirror();
+                });
+                startLive();
+            } else {
+                log("云端还没起，第一次点「开始生成」会自己拉起来（约 10-15 分钟）");
+            }
+        });
+    }
+
+    // ---------------- 终端实时回显 ----------------
+    private void liveReset() {
+        liveTaskId = "";
+        liveT0 = 0;
+        liveShown = 0;
+        ui.post(() -> {
+            if (tvSteps != null) tvSteps.setText("等待任务…");
+            if (progBar != null) progBar.setProgress(0);
+            if (tvTermHead != null) tvTermHead.setText("③ 终端 · 待命");
+            if (stageChips != null) stageChips.removeAllViews();
+            if (tvPreviewNote != null && !mirrorMode)
+                tvPreviewNote.setText("过程图还没有（云端每采一步会推一张）");
+        });
+    }
+
+    /** 进入终端页就开始流：不需要点任何按钮，生成中才真正有东西可看。 */
+    private void startLive() {
+        if (!liveOn.compareAndSet(false, true)) return;
+        pool.execute(() -> {
+            while (liveOn.get() && !isFinishing()) {
+                try {
+                    Api a = apiCached();
+                    JSONObject s = new JSONObject(a.consoleJson());
+                    renderLive(s);
+                } catch (Exception ignore) {
+                    // 云端没起来 / 隧道抖一下都算正常，不打断终端
+                }
+                try { Thread.sleep(1500); } catch (InterruptedException e) { return; }
+            }
+        });
+    }
+
+    /**
+     * 一条流里有三种东西：阶段线（云端走到哪一站）、任务进度（第几步）、日志。
+     * 阶段与进度画在顶部，日志继续往下滚，过程图单独一个 ImageView 直连。
+     * 注意：日志不在这一路多画一遍——本机 log() 已经写过了，云端的行由
+     * pollTask 里那一步补进同一条时间线，否则同一条日志会出现两份。
+     */
+    private void renderLive(JSONObject s) {
+        final String stage = s.optString("stage", "");
+        final JSONArray stages = s.optJSONArray("stages");
+        final JSONObject t = s.optJSONObject("task");
+        ui.post(() -> {
+            if (stages != null && stageChips != null) {
+                stageChips.removeAllViews();
+                LinearLayout row = new LinearLayout(this);
+                row.setOrientation(LinearLayout.HORIZONTAL);
+                for (int i = 0; i < stages.length() && i < 8; i++) {
+                    String n = stages.optJSONObject(i).optString("name", "");
+                    TextView chip = Ui.label(this, n, 10,
+                            n.equals(stage) ? 0xFF07100E : Ui.MUTED);
+                    chip.setBackground(Ui.rounded(this, n.equals(stage) ? Ui.ACCENT : 0xFF141B24, 99, Ui.LINE));
+                    chip.setPadding(Ui.dp(this, 8), Ui.dp(this, 2), Ui.dp(this, 8), Ui.dp(this, 2));
+                    LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                    lp.rightMargin = Ui.dp(this, 6);
+                    row.addView(chip, lp);
+                }
+                stageChips.addView(row);
+            }
+            if (tvStageLine != null && !stage.isEmpty()) tvStageLine.setText("阶段 " + stage);
+            if (t == null || tvSteps == null) return;
+            String st = t.optString("state", "");
+            int total = t.optInt("total", 0), step = t.optInt("step", 0);
+            double pct = t.optDouble("pct", 0);
+            if ("running".equals(st)) {
+                tvSteps.setText(String.format(java.util.Locale.US,
+                        "%d/%d 步 · %.0f%% · %.0fs · %s", step, total, pct,
+                        t.optDouble("elapsed", 0), t.optString("shape", "")));
+                if (progBar != null) progBar.setProgress((int) Math.round(pct * 10));
+                tvTermHead.setText("③ 终端 · 生成中");
+                if (!mirrorMode) pullPreview(t.optString("id", ""), step);
+            } else if ("done".equals(st)) {
+                if (liveOn.get()) ui.post(() -> {
+                    if (progBar != null) progBar.setProgress(1000);
+                });
+            } else if ("error".equals(st)) {
+                String d = t.optString("detail", "");
+                tvSteps.setText("云端报错：" + d.substring(0, Math.min(80, d.length())));
+                tvTermHead.setText("③ 终端 · 失败");
+            } else {
+                tvTermHead.setText("③ 终端 · " + (stage.isEmpty() ? "待命" : stage));
+            }
+        });
+    }
+
+    /**
+     * 过程图直连：/qwen/preview 每次回一张当前 latent 的缩略图。
+     *
+     * 为什么要自己拉而不全靠镜像：WebView 里那张小图在弱网下会糊成灰块，
+     * 直连这条能自己控制频率（每 3 步一次），也让终端页在镜像关掉时仍有东西可看。
+     */
+    private void pullPreview(final String tid, final int step) {
+        if (tid == null || tid.isEmpty()) return;
+        if (step - liveShown < 3) return;   // 每 3 步拉一次，别把隧道挤爆
+        liveShown = step;
+        pool.execute(() -> {
+            try {
+                byte[] png = apiCached().preview(tid);
+                if (png == null || png.length < 100) return;
+                Bitmap bm = BitmapFactory.decodeByteArray(png, 0, png.length);
+                if (bm == null) return;
+                ui.post(() -> {
+                    if (mirrorMode) return;
+                    termPreview.setImageBitmap(bm);
+                    tvPreviewNote.setText("第 " + step + " 步的过程图 · 采样中会脏，正常");
+                });
+            } catch (Exception ignore) {
+                // 这一步图没拿到不影响任何事，下一步还有
+            }
+        });
+    }
+
     private void renderTasks() {
         try {
             String raw = etPrompt.getText().toString().trim();
@@ -307,9 +636,39 @@ public class MainActivity extends Activity {
             if (tvPromptPreview != null) tvPromptPreview.setText("实际提示词：" + full);
             byte[] blob = Crypto.encodeTask(raw, key());
             tvTaskHex.setText("本地加密 " + blob.length + "B · " + Crypto.hex(blob).substring(0, 40) + "…");
+            // 创建页右边那行小字：每次改参数就重算一遍，让人看见「发出去的是什么」
+            if (tvEnvelope != null) {
+                byte[] env = Crypto.packTask(fieldsFor(full, stepsNow(), cfgNow(), seedNow(), batch,
+                        wNow(), hNow(), nsfwNow()), key());
+                tvEnvelope.setText("信封 " + env.length + "B · " + Crypto.hex(env).substring(0, 24) + "…");
+            }
         } catch (Exception e) {
             tvTaskHex.setText("加密失败: " + e.getMessage());
         }
+    }
+
+    // 创建页的那几个数：renderTasks 只是回显，读不到就退回默认值，别抛
+    private int stepsNow() { return parseInt(etSteps == null ? "" : etSteps.getText().toString(), D_STEPS); }
+    private double cfgNow() { return parseD(etCfg == null ? "" : etCfg.getText().toString(), D_CFG); }
+    private long seedNow() { return parseLong(etSeed == null ? "" : etSeed.getText().toString(), D_SEED); }
+    private int wNow() { return align(parseInt(etW == null ? "" : etW.getText().toString(), D_SIZE)); }
+    private int hNow() { return align(parseInt(etH == null ? "" : etH.getText().toString(), D_SIZE)); }
+    private boolean nsfwNow() { return swNsfw == null || swNsfw.isChecked(); }
+
+    /** 一封待发的任务，字段顺序与 generate() 里那份一致：同一个界面切来切去，看到的必须是同一封信。 */
+    private java.util.LinkedHashMap<String, Object> fieldsFor(String prompt, int steps, double cfg,
+                                                             long seed, int batch, int w, int h, boolean nsfw) {
+        java.util.LinkedHashMap<String, Object> f = new java.util.LinkedHashMap<>();
+        f.put("prompt", prompt);
+        f.put("negative", "");
+        f.put("steps", steps);
+        f.put("cfg", cfg);
+        f.put("seed", seed);
+        f.put("batch", batch);
+        f.put("width", w);
+        f.put("height", h);
+        f.put("nsfw", nsfw);
+        return f;
     }
 
     private void pickStyle() {
@@ -515,6 +874,9 @@ public class MainActivity extends Activity {
         cancelled.set(false);
         btnRun.setEnabled(false);
         btnRun.setText("准备中…");
+        // 点下去就翻到终端：从这一秒开始，所有动静都在那一页里发生
+        showPage(false);
+        startLive();
         // 用户点下去的第一秒就要有回音：以前这里什么都不打，
         // 只在后台线程里碰 SharedPreferences / 探活，一卡就是一分钟的空屏。
         log("=== 点击「一键出图」 · " + clock() + " ===");
@@ -622,18 +984,27 @@ public class MainActivity extends Activity {
         });
     }
 
+    /**
+     * 等图这一段，以前是「每 15 秒报一行」，用户只能看秒数涨。
+     * 现在两个口同时开：/qwen/task 说状态，/qwen/steps 说第几步，
+     * /qwen/preview 说「现在长什么样」。三样一起，才叫实时看到生成到了哪步。
+     */
     private void afterSubmit(String tid, Api a, byte[] env) throws Exception {
         ui.post(() -> {
             setStatus("生成中…", 0xFFE0B341);
             btnRun.setText("生成中…");
         });
-        log("⑤ 已交给 GPU：T4 上 1024×1024/20 步约 4 分钟，这里会每 15 秒报一次进度");
+        log("⑤ 已交给 GPU：T4 上 1024×1024/20 步约 4 分钟，每 2 秒刷一次进度");
         long t0 = System.currentTimeMillis();
+        liveT0 = t0;
+        liveTaskId = tid;
+        liveShown = 0;
         JSONObject st = null;
         int fails = 0;
-        long nextBeat = 0;
+        int lastStep = -1;
         String lastState = "";
         String lastTip = "";
+        long lastLogAt = 0;
         while (true) {
             if (cancelled.get()) throw new InterruptedException("已取消");
             try {
@@ -656,21 +1027,52 @@ public class MainActivity extends Activity {
             }
             if ("done".equals(state)) break;
             if ("error".equals(state)) throw new IllegalStateException("云端报错: " + st.optString("detail"));
+
             long sec = (System.currentTimeMillis() - t0) / 1000;
+            // 逐节点步骤：这是「生成到了哪一步」最直接的答案
+            int step = -1, total = 0;
+            JSONObject rep = null;
+            try {
+                rep = a.steps(tid);
+                step = rep.optInt("step", -1);
+                total = rep.optInt("total", 0);
+            } catch (Exception ignore) {}
+            if (step >= 0 && step != lastStep) {
+                lastStep = step;
+                final int fs = step, ft = total;
+                final double pct = rep.optDouble("pct", 0);
+                if (step > 0 || lastState.isEmpty()) {
+                    log("   采样 " + step + "/" + (total > 0 ? String.valueOf(total) : "?") + " 步"
+                            + " · " + sec + "s" + (pct > 0 ? String.format(java.util.Locale.US, " · %.0f%%", pct) : ""));
+                }
+                ui.post(() -> {
+                    if (tvSteps != null)
+                        tvSteps.setText(String.format(java.util.Locale.US, "%d/%d 步 · %.0f%% · %ds",
+                                fs, ft, pct, sec));
+                    if (progBar != null) progBar.setProgress((int) Math.round(pct * 10));
+                    if (tvTermHead != null) tvTermHead.setText("③ 终端 · 生成中");
+                });
+            }
+            // 过程图：终端页正在看的时候才拉，每 3 步一张
+            if (step > 0 && !mirrorMode) pullPreview(tid, step);
+
             if (!state.equals(lastState)) {
                 if (!state.isEmpty()) log("   云端状态 " + state + " · " + sec + "s");
                 lastState = state;
             }
-            // 每 15 秒留一行：屏幕在转、日志也在动，用户才能分清"在跑"和"卡死"
-            if (sec >= nextBeat) {
-                nextBeat = sec + 15;
-                log("   生成中 " + sec + "s · " + state
-                        + (st.has("queue") ? " · 队首" + st.optInt("queue") + " 个" : ""));
+            // 没有逐节点回调时（老 ComfyUI）退回每 20 秒一行，别让日志彻底静止
+            if (sec - lastLogAt >= 20) {
+                lastLogAt = sec;
+                if (step <= 0)
+                    log("   生成中 " + sec + "s · " + state
+                            + (st.has("queue") ? " · 队首" + st.optInt("queue") + " 个" : ""));
             }
             final long fs = sec;
+            final int fstep = step;
             ui.post(() -> {
                 setStatus("生成中 " + fs + "s", 0xFFE0B341);
                 btnRun.setText("生成中 " + fs + "s");
+                if (fstep <= 0 && tvSteps != null) tvSteps.setText("等第一步 · " + fs + "s · " + state);
             });
             Thread.sleep(2000);
         }
@@ -690,6 +1092,7 @@ public class MainActivity extends Activity {
         }
         if (got.isEmpty()) throw new IllegalStateException("图片解码失败");
         final byte[] png = firstPng;
+        final double usedSec = st.optDouble("elapsed", 0);
         log("⑥ 出图 " + got.size() + " 张 " + got.get(0).getWidth() + "x" + got.get(0).getHeight()
                 + " · 用时 " + st.optDouble("elapsed", 0) + "s · 信封 " + env.length + "B（全程未明文过网）");
         ui.post(() -> {
@@ -699,6 +1102,15 @@ public class MainActivity extends Activity {
             rebuildGallery();
             setStatus("完成", Ui.ACCENT);
             resetBtn();
+            liveOn.set(false);
+            if (tvTermHead != null) tvTermHead.setText("③ 终端 · 完成");
+            if (tvSteps != null) tvSteps.setText("完成 · " + got.size() + " 张 · " + usedSec + "s");
+            if (progBar != null) progBar.setProgress(1000);
+            tvPreviewNote.setVisibility(View.VISIBLE);
+            tvPreviewNote.setText("成品已存进「创建」页的结果区 · 过程图到此结束");
+            // 图都出来了：终端那条流收掉，终端页留一个静态的「完成」
+            termPreviewMode = false;
+            applyTermView();
         });
     }
 
@@ -721,7 +1133,7 @@ public class MainActivity extends Activity {
     private void resetBtn() {
         ui.post(() -> {
             btnRun.setEnabled(true);
-            btnRun.setText("一键出图");
+            btnRun.setText("开始生成 →");
         });
     }
 
@@ -772,14 +1184,30 @@ public class MainActivity extends Activity {
                     ui.post(() -> {
                         tvCloud.setText("云端在线 · " + base.replace("https://", ""));
                         setStatus("在线", Ui.ACCENT);
+                        attachMirror();
                     });
             });
         }
+        // 回到前台就继续流：终端页上的数字不该停在那儿等人再点一下
+        if (!sp.getString("url", "").isEmpty()) startLive();
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        // 后台不拉流，也不让 WebView 里的定时器继续跑
+        liveOn.set(false);
+        if (mirror != null) mirror.onPause();
     }
 
     @Override
     protected void onDestroy() {
         cancelled.set(true);
+        liveOn.set(false);
+        if (mirror != null) {
+            mirror.loadUrl("about:blank");
+            mirror.destroy();
+        }
         pool.shutdownNow();
         super.onDestroy();
     }
