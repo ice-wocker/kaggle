@@ -156,9 +156,27 @@ final class Kaggle {
     static String localHint(String raw) {
         String k = normalizeKey(raw);
         if (k.isEmpty()) return "还没填 Key";
-        if (isToken(k)) return "看起来像一个 KGAT_ 令牌";
+        if (isToken(k)) return "看起来像一个 KGAT_ 令牌（" + k.length() + " 位）";
         if (k.length() == 32) return "看起来像旧式 32 位 key（用户名可留空）";
         return "长度 " + k.length() + "，既不像 KGAT_ 令牌也不像 32 位 key——先按原样试，不行再回 Kaggle 设置页核对";
+    }
+
+    /**
+     * 把失败拆成人能听懂的一句。401 不等于 Key 错：字段错、账号名对不上、
+     * 令牌被网页截断，都会让 Kaggle 回同一个 401，而人只看得到"鉴权没过"。
+     */
+    static String explain(String rawKey, String user, String err) {
+        String k = normalizeKey(rawKey);
+        String u = user == null ? "" : user.trim();
+        if (!isToken(k) && k.length() == 32) {
+            if (u.isEmpty()) return "旧式 32 位 key 要靠用户名配对，这一格填 kaggle.com/ 后面的 handle";
+            if (u.chars().anyMatch(c -> c > 127)) return "用户名里有非 ASCII 字符：" + u + " 多半是昵称，换成 handle";
+        }
+        if (err != null && err.contains("hello"))
+            return "hello 只是探测点，它不认不代表 Key 不对；真正的判断在 push/status，那两步的报错更准";
+        if (err != null && err.contains("不匹配"))
+            return "账号名和 Key 不是同一个人的：勾「KGAT_」并把用户名清空，让接口自己认";
+        return err == null ? "" : err;
     }
 
     // ---------------- 起活 ----------------

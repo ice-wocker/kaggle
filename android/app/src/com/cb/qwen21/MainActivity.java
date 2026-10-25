@@ -520,9 +520,9 @@ public class MainActivity extends Activity {
                 setStatus("鉴权没过", 0xFFE05B5B);
                 // Kaggle 那句 "Key 无效" 太笼统：设备令牌、账号归属、云端令牌都可能
                 log("出错: " + (e.getMessage() == null ? "鉴权没过" : e.getMessage()));
-                if (e.getMessage() != null && e.getMessage().contains("Kaggle"))
-                    log("  提示: a) 新版页面只给一个 KGAT_ 令牌，用户名留空即可"
-                            + " b) 用户名别填成昵称，必须是 kaggle.com/后面那个 handle");
+                String tip = Kaggle.explain(etKey.getText().toString(),
+                        etUser.getText().toString(), e.getMessage());
+                if (!tip.isEmpty()) log("  诊断: " + tip);
                 resetBtn();
             } catch (Exception e) {
                 setStatus("失败", 0xFFE05B5B);
