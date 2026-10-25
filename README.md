@@ -141,12 +141,43 @@ owner 若是 `me`（hello 没探出账号时的兜底），Kaggle 回的是 `400
 两条都空就**不推**，直接说"把 handle 填进用户名那格"，而不是推个 `me/` 上去换一句听不懂的话。
 载荷里 `language` 同时写在 `source.language` 与 `source.slug.language`，`name`/`id` 成对给。
 
+## 装到设备上实测过
+
+不是「应该能装」，是真装上去跑过：Android 7.0（minSdk 24 下限）与 Android 14（targetSdk 34 上限）
+各起一台 x86_64 模拟器，`adb install` 直装仓库里这个 APK。
+
+| | Android 7.0 | Android 14 |
+| --- | --- | --- |
+| 安装 | Success | Success |
+| 启动 | 无崩溃，UI 全渲染 | 无崩溃，splash 走完进主界面 |
+| 首屏 | ![](docs/device/a7-ui.png) | ![](docs/device/a14-ui.png) |
+
+装下去第一眼就是这个（Android 14）：
+
+![设备实拍](docs/device/a14-ui.png)
+
+顺带把端上那条本地路径也验了：默认提示词在设备上现封密文是
+`cb210100005892cb064e14e381e64030b57ac39c…`（94B），
+`kaggle/verify_seal.py` 用独立 Python 实现算同一份输入，**字节级相同**。
+这个脚本能直接跑，不依赖 Android：
+
+```bash
+python3 kaggle/verify_seal.py    # 密文 + 信封 packTask 双向校验
+```
+
+没 Key 就点「一键出图」，也不会崩：状态灯转红「失败」，日志写
+`出错: 先填 Kaggle API Key（KGAT_ 开头那个令牌，粘 export 整行也行）`，
+按钮自己复位。这条也截了图：`docs/device/a14-log-nokey.png`。
+
 ## 已知边界
 
 - **首次要等**：装环境 + 17GB 权重约 10-15 分钟，这不是 APK 能优化的部分。
 - **单次会话上限 12 小时**：到期前云端自己 push 新版本接棒，旧会话优雅退出。
   重启后要重新下权重（这就是上面说的 /tmp 取舍换来的可靠续跑）。
-- **没在真机 + 真 GPU 上端到端跑过**：本次只验证到
-  ①Java↔Python 信封字节级互验 ②APK 内嵌内核 vs 仓库源码 sha256 一致
-  ③真实 aiohttp 服务上跑通「加密上传 → 解封 → 拼工作流 → 出图 → 取回」
-  ④节点路由单测（鉴权 401 / 排队 / 完成）。推理那一步需要 T4。
+- **真 GPU 推理没在设备上端到端跑过**：设备侧验到的是
+  ①安装/启动/UI 渲染（A7 + A14 双版本实拍）②设备内密文与独立 Python 实现字节级一致
+  ③无 Key 的失败路径优雅收场。再往后要 Kaggle 账号：`kernels/push` 起 T4、
+  等隧道地址下发、出图取回，那一段需要真 Key 才能走，模拟器替不了。
+- **模拟器无 KVM 时极慢**：本次宿主没有 `/dev/kvm`，全程 QEMU TCG 纯软件模拟，
+  Android 14 冷启约 5 分钟、偶发系统级 ANR 弹窗（是 `process system` / `System UI`
+  超时，不是本 App）。这台机器上的截图因此拍得比较费劲，但 App 本身进程始终存活、界面正常。
