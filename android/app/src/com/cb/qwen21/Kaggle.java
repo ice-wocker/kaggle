@@ -35,8 +35,8 @@ final class Kaggle {
     private final String user, key;
 
     Kaggle(String user, String key) {
-        this.user = user.trim();
-        this.key = key.trim();
+        this.user = user == null ? "" : user.trim();
+        this.key = normalizeKey(key);
     }
 
     // ---------------- HTTP ----------------
@@ -81,24 +81,60 @@ final class Kaggle {
                 "application/json");
     }
 
-    // ---------------- 账号 ----------------
+    // ---------------- 凭据 ----------------
+
+    /**
+     * 新版 Kaggle 只发一个 KGAT_ 令牌，用户名也跟着它走；旧版才是 user + 32 位 key。
+     * 两种情况都要能活，不能因为没填用户名就把人拦在门外。
+     */
+    static boolean isToken(String key) {
+        return key != null && key.trim().toUpperCase().startsWith("KGAT_");
+    }
+
+    /** 从用户粘进来的任何东西里捞出真实凭据：带前缀的 URL、export 行、~/.kaggle/access_token 都有人贴。 */
+    static String normalizeKey(String raw) {
+        if (raw == null) return "";
+        String s = raw.replace("\r", " ").replace("\n", " ").replace("\"", "").replace("'", "").trim();
+        // export KAGGLE_API_TOKEN=KGAT_xxx / KAGGLE_KEY=xxx 这类整行；用户名不算凭据，不能抓错
+        java.util.regex.Matcher kv = Pattern.compile("(?i)KAGGLE_(?:API_)?(?:TOKEN|KEY)\\s*=\\s*(\\S+)").matcher(s);
+        if (kv.find()) s = kv.group(1);
+        // 一整行 URL / 完整网页都贴进来的，取最长的那段合法字符
+        java.util.regex.Matcher tok = Pattern.compile("[A-Za-z0-9_\\-]{16,}").matcher(s);
+        String best = "";
+        while (tok.find()) if (tok.group().length() > best.length()) best = tok.group();
+        return best.isEmpty() ? s : best;
+    }
+
+    /** 单个字段就能开工：KGAT_ 自带身份，旧式 key 靠用户名配对。 */
+    static boolean complete(String user, String key) {
+        String k = normalizeKey(key);
+        if (k.isEmpty()) return false;
+        return isToken(k) || !(user == null || user.trim().isEmpty());
+    }
+
+    /** hello 会回 token 与 userName，两个都拿，谁先到用谁。 */
+    JSONObject whoami() throws Exception {
+        Res r = json(HOST + "/api/v1/hello", "GET", null);
+        if (r.code == 401 || r.code == 403) throw new Api.AuthError("API Key 无效或无权限");
+        if (r.code >= 400) throw new Api.KaggleException("hello HTTP " + r.code);
+        return r.json();
+    }
 
     /** 真实账号名：Key 属于谁，内核就推到谁名下。省掉一个要用户手填的字段。 */
     String resolveUser() throws Exception {
-        Res r = json(HOST + "/api/v1/hello", "GET", null);
-        if (r.code == 200) {
-            JSONObject o = r.json();
-            String u = o.optString("userName", "");
-            if (!u.isEmpty()) return u;
-        }
-        if (r.code == 401 || r.code == 403) throw new Api.AuthError("API Key 无效或无权限");
-        // hello 不可用时退回 auth 探测
-        return user;
+        JSONObject o = whoami();
+        String u = o.optString("userName", "");
+        if (u.isEmpty()) u = o.optString("username", "");
+        if (!u.isEmpty()) return u;
+        // hello 不认这个 Key 的形态时，退回用户自己填的（旧式 KAGGLE_KEY 场景）
+        if (!user.isEmpty() && !"me".equals(user)) return user;
+        throw new Api.AuthError("认不出这个 Key 属于哪个账号，请补填 Kaggle 用户名");
     }
 
     boolean checkKey() {
         try {
-            return resolveUser() != null && !resolveUser().isEmpty();
+            resolveUser();
+            return true;
         } catch (Api.AuthError e) {
             return false;
         } catch (Exception e) {
@@ -138,8 +174,10 @@ final class Kaggle {
         payload.put("source", s);
         payload.put("isRetry", false);
         Res r = json(HOST + "/api/v1/kernels/push", "POST", payload);
-        if (r.code == 401 || r.code == 403) throw new Api.AuthError("API Key 无效或无权限");
-        if (r.code >= 400) throw new Api.KaggleException("push 失败 HTTP " + r.code + ": " + shortBody(r.text()));
+        if (r.code == 401 || r.code == 403)
+            throw new Api.AuthError("推内核被拒（HTTP " + r.code + "）：Key 没权限或已失效");
+        if (r.code >= 400)
+            throw new Api.KaggleException("push 失败 HTTP " + r.code + ": " + shortBody(r.text()) + hint(r.text()));
         return r.text();
     }
 
@@ -149,7 +187,11 @@ final class Kaggle {
         String status = "";
         String failure = "";
         boolean ok() { return "COMPLETE".equalsIgnoreCase(status); }
-        boolean failed() { return status != null && status.toUpperCase().contains("ERROR"); }
+        /** Kaggle 有的内核是 COMPLETE 收尾，失败信息只在 failureMessage 里，所以两个都要看。 */
+        boolean failed() {
+            if (status != null && status.toUpperCase().contains("ERROR")) return true;
+            return failure != null && !failure.isEmpty();
+        }
         boolean running() { return "RUNNING".equalsIgnoreCase(status); }
         boolean queued() { return "QUEUED".equalsIgnoreCase(status); }
     }
@@ -157,11 +199,29 @@ final class Kaggle {
     KernelState status(String owner) throws Exception {
         Res r = json(HOST + "/api/v1/kernels/status/" + enc(owner + "/" + SLUG), "GET", null);
         if (r.code == 404) return new KernelState();
+        if (r.code == 401 || r.code == 403)
+            throw new Api.AuthError("查内核状态被拒（HTTP " + r.code + "）：Key 与账号 " + owner + " 不匹配");
         if (r.code >= 400) throw new Api.KaggleException("status HTTP " + r.code);
         JSONObject o = r.json();
         KernelState k = new KernelState();
+        // 老版本字段叫 status，新版本是 result.status（或 history[].status）
         k.status = o.optString("status", "").toUpperCase();
+        if (k.status.isEmpty()) {
+            JSONObject res = o.optJSONObject("result");
+            if (res != null) k.status = res.optString("status", "").toUpperCase();
+        }
+        if (k.status.isEmpty()) {
+            JSONArray hist = o.optJSONArray("history");
+            if (hist != null && hist.length() > 0) {
+                JSONObject last = hist.optJSONObject(hist.length() - 1);
+                if (last != null) k.status = last.optString("status", "").toUpperCase();
+            }
+        }
         k.failure = o.optString("failureMessage", "");
+        if (k.failure.isEmpty()) {
+            JSONObject res = o.optJSONObject("result");
+            if (res != null) k.failure = res.optString("failureMessage", "");
+        }
         return k;
     }
 
@@ -220,6 +280,15 @@ final class Kaggle {
         return s.length() <= max ? s : s.substring(s.length() - max);
     }
 
+    /** Kaggle 的报错常常只有一句 "Forbidden"，把最可能的下一步直接写出来。 */
+    private static String hint(String body) {
+        String b = body == null ? "" : body.toLowerCase();
+        if (b.contains("phone") || b.contains("verif")) return "（账号需要先完成手机验证）";
+        if (b.contains("gpu") || b.contains("quota")) return "（GPU 额度用完，或该账号还没有 GPU 资格）";
+        if (b.contains("permission") || b.contains("forbidden")) return "（这个 Key 无权 push 到该账号，检查是否属同一账号）";
+        return "";
+    }
+
     private static String shortBody(String s) {
         return s == null ? "" : s.substring(0, Math.min(300, s.length()));
     }
@@ -244,6 +313,17 @@ final class Kaggle {
         boolean cancelled() { return false; }
     }
 
+    /** 手机里已有的地址+令牌还有效吗？查一次 /qwen/health：能连上且令牌对，就不用惊动 Kaggle。 */
+    static boolean alive(String url, String token) {
+        if (url == null || url.isEmpty()) return false;
+        try {
+            JSONObject h = probe(url, token);
+            return h.optBoolean("ok") && h.optBoolean("auth", true);
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
     /**
      * 端到端：起活 -> 等地址 -> 探活。返回可用的 {url, token}。
      * 每一步都上报，手机端能看到卡在哪，而不是干等一个转圈。
@@ -255,9 +335,9 @@ final class Kaggle {
 
         p.stage("检查云端会话");
         KernelState cur = status(owner);
-        if (cur.running()) {
-            // 已经在跑就别再 push：push 会重启会话，等于白白再等一次冷启动
-            p.stage("会话已在运行");
+        if (cur.running() || cur.queued()) {
+            // 已经在跑/排着队就别再 push：push 会重启会话，等于白白再等一次冷启动
+            p.stage(cur.queued() ? "会话排队中" : "会话已在运行");
         } else {
             p.stage("启动云端 GPU 会话");
             try {
@@ -272,7 +352,8 @@ final class Kaggle {
             if (p.cancelled()) throw new InterruptedException("已取消");
             KernelState k = status(owner);
             long el = (System.currentTimeMillis() - t0) / 1000;
-            if (k.failed() && !k.failure.isEmpty()) throw new Api.KaggleException("云端失败: " + k.failure);
+            if (k.failed()) throw new Api.KaggleException(
+                    "云端失败" + (k.failure.isEmpty() ? "(" + k.status + ")" : ": " + k.failure));
 
             JSONObject hub = parseHub(logTail(owner, 160000));
             String stage = hub == null ? "" : hub.optString("stage", "");
