@@ -66,6 +66,9 @@ public class MainActivity extends Activity {
     private android.widget.CompoundButton swNsfw, swQuality;
     private String styleName = "自动";
     private byte[] lastPng;
+    /** 当前请求打到的是云端（ComfyUI）还是 Kaggle：两者都回 401，但原因完全不同。 */
+    private final java.util.concurrent.atomic.AtomicBoolean isCloudStep =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
 
     @Override
     protected void onCreate(Bundle b) {
@@ -405,8 +408,17 @@ public class MainActivity extends Activity {
      * 云端已经在线时这一步几乎瞬时，所以每次出图前都跑一遍也没成本。
      */
     private void ensureCloud() throws Exception {
-        String base = sp.getString("url", "");
+        ensureCloud(false);
+    }
+
+    /**
+     * @param force 上次出图被云端 401 挡下时置真：不信本地缓存的地址与令牌，
+     *              重新走一遍「读日志拿地址」的握手。Key 本身没问题，别把它也一起否了。
+     */
+    private void ensureCloud(boolean force) throws Exception {
+        String base = force ? "" : sp.getString("url", "");
         String token = sp.getString("token", "");
+        if (force) log("上次被云端挡下，清掉缓存地址重新握手");
         if (!base.isEmpty()) {
             try {
                 JSONObject h = Kaggle.probe(base, token);
@@ -444,7 +456,7 @@ public class MainActivity extends Activity {
         java.util.Map<String, String> got = new Kaggle(effUser, key).bringUp(key, p, 20 * 60 * 1000L);
         final String url = got.get("url"), tok = got.get("token");
         sp.edit().putString("url", url).putString("token", tok)
-                .putString("owner", got.get("owner")).apply();
+                .putString("owner", got.get("owner")).putString("egress", got.get("egress")).apply();
         ui.post(() -> {
             tvCloud.setText("云端在线 · " + url.replace("https://", ""));
             setStatus("在线", Ui.ACCENT);
@@ -453,6 +465,10 @@ public class MainActivity extends Activity {
     }
 
     private void generate() {
+        generate(false);
+    }
+
+    private void generate(boolean rehandshake) {
         cancelled.set(false);
         btnRun.setEnabled(false);
         btnRun.setText("准备中…");
@@ -492,8 +508,10 @@ public class MainActivity extends Activity {
         pool.execute(() -> {
             try {
                 // 1) 云端：Key 换地址，已经在线就秒过
-                ensureCloud();
+                isCloudStep.set(false);
+                ensureCloud(rehandshake);
                 Api a = api();
+                isCloudStep.set(true);
 
                 // 2) 端上封一个信封：提示词 + 全部参数一起加密，明文不出设备
                 java.util.LinkedHashMap<String, Object> f = new java.util.LinkedHashMap<>();
@@ -517,13 +535,29 @@ public class MainActivity extends Activity {
                 afterSubmit(tid, a, env);
 
             } catch (Api.AuthError e) {
-                setStatus("鉴权没过", 0xFFE05B5B);
-                // Kaggle 那句 "Key 无效" 太笼统：设备令牌、账号归属、云端令牌都可能
-                log("出错: " + (e.getMessage() == null ? "鉴权没过" : e.getMessage()));
-                String tip = Kaggle.explain(etKey.getText().toString(),
-                        etUser.getText().toString(), e.getMessage());
-                if (!tip.isEmpty()) log("  诊断: " + tip);
-                resetBtn();
+                String msg = e.getMessage() == null ? "401" : e.getMessage();
+                boolean fromCloud = msg.contains("/qwen/") || msg.contains("unauthorized")
+                        || isCloudStep.get();
+                log("出错: " + msg);
+                if (fromCloud) {
+                    setStatus("云端 401", 0xFFE05B5B);
+                    log("  云端不认这个令牌，跟你的 Kaggle Key 无关");
+                    if (!rehandshake && !cancelled.get()) {
+                        log("  自动重来一次：丢掉旧地址与旧令牌，重新握手");
+                        resetBtn();
+                        new android.os.Handler(android.os.Looper.getMainLooper())
+                                .postDelayed(() -> generate(true), 1200);
+                    } else {
+                        log("  诊断: 云端会话可能刚交班，稍等几分钟再点一次；仍不行就把上面这行发我");
+                        resetBtn();
+                    }
+                } else {
+                    setStatus("Kaggle 拒绝", 0xFFE05B5B);
+                    String tip = Kaggle.explain(etKey.getText().toString(),
+                            etUser.getText().toString(), msg);
+                    if (!tip.isEmpty()) log("  诊断: " + tip);
+                    resetBtn();
+                }
             } catch (Exception e) {
                 setStatus("失败", 0xFFE05B5B);
                 log("出错: " + e.getMessage());

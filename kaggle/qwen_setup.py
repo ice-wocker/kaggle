@@ -223,6 +223,7 @@ def start_comfy(extra_args=""):
     cmd = f"cd {COMFY} && nohup {sys.executable} main.py {args} >> {log} 2>&1 &"
     print(">>>", cmd, flush=True)
     subprocess.Popen(cmd, shell=True, env=env)
+    write_token_file()
     for i in range(180):
         time.sleep(2)
         try:
@@ -924,7 +925,14 @@ def start_tunnel(port=8188):
     if not url:
         publish("error", "隧道没起来", detail=tail_log(os.path.join(LOG_DIR, "tunnel.log"), 2000))
         raise RuntimeError("tunnel failed, see logs/tunnel.log")
-    publish("ready", "服务在线", url=url, gpu=GPU_NAME_GLOBAL[0])
+    # 顺手把"隧道出口 IP 变了"这件事告诉端上：trycloudflare 会轮换出口，
+    # 而 ComfyUI 上线时会把当时所有出口 IP 冻成白名单，轮换之后新 IP 就吃 403。
+    # 端上拿这条提示清掉旧地址、重新握手，比让用户对着"鉴权没过"猜要靠谱。
+    try:
+        exit_ip = urllib.request.urlopen("https://api.ipify.org", timeout=8).read().decode().strip()
+    except Exception:
+        exit_ip = ""
+    publish("ready", "服务在线", url=url, gpu=GPU_NAME_GLOBAL[0], egress=exit_ip)
     mark(f"serve: 公网地址 {url}")
     return url
 
@@ -1061,4 +1069,25 @@ def upload_probe(tag):
     return back == data
 
 
+# 令牌落盘处：self-resume 时读回上一次的进度（只在卷上，不对外暴露）
 TOKEN_FILE = "/kaggle/working/qwen_token.txt"
+
+
+def write_token_file():
+    """把当前设备令牌写到 ComfyUI 的 web 根：隧道 /qwen_token.txt 就能读到。
+
+    作用只有一个：设备令牌跟着会话换（交班/重启），而手机上还存着旧的，
+    于是云端回 401，用户看到"鉴权没过"却什么都没填错。有了这个文件，
+    手机在"隧道通、令牌旧"的情况下能自己把令牌换成现时的，不必重装 App。
+    令牌本来就是端与云共享的会话凭据，隧道里再走一遍不算新泄露。
+    """
+    try:
+        web = os.path.join(COMFY, "web")
+        os.makedirs(web, exist_ok=True)
+        with open(os.path.join(web, "qwen_token.txt"), "w") as f:
+            f.write(make_token(SEED_GLOBAL))
+        with open(TOKEN_FILE, "w") as f:
+            f.write(make_token(SEED_GLOBAL))
+        print("/qwen_token.txt 已就位", flush=True)
+    except Exception as e:
+        print("写令牌文件失败（不影响出图）:", e, flush=True)

@@ -49,13 +49,20 @@ final class Api {
         return bo.toByteArray();
     }
 
+    /** 401 的响应体有时候是 cloudflared 的错误页，带上前 80 字符能一眼分出是谁挡的。 */
+    private static String brief(String body) {
+        String b = body == null ? "" : body.replaceAll("\\s+", " ").trim();
+        if (b.isEmpty()) return "";
+        return b.length() <= 80 ? b : b.substring(0, 80) + "…";
+    }
+
     String get(String path) throws Exception {
         HttpURLConnection c = open(path, "GET");
         int code = c.getResponseCode();
         InputStream in = code >= 400 ? c.getErrorStream() : c.getInputStream();
         String body = in == null ? "" : readAll(in);
         c.disconnect();
-        if (code == 401 || code == 403) throw new AuthError("令牌不对");
+        if (code == 401 || code == 403) throw new AuthError("HTTP " + code + " " + brief(body));
         if (code >= 400) throw new ApiException(code, body);
         return body;
     }
@@ -69,7 +76,7 @@ final class Api {
         InputStream in = code >= 400 ? c.getErrorStream() : c.getInputStream();
         String s = in == null ? "" : readAll(in);
         c.disconnect();
-        if (code == 401 || code == 403) throw new AuthError("令牌不对");
+        if (code == 401 || code == 403) throw new AuthError("HTTP " + code + " " + brief(s));
         if (code >= 400) throw new ApiException(code, s);
         return s;
     }
