@@ -134,6 +134,13 @@ CB 22 01 00 | len(2) | Feistel( b"Q2" | n × [klen key vlen type payload] )
 
 已做双向交叉验证：Java 码字 → Python 图 → Java 读回，以及反向；中英日韩 + emoji + 换行 + 符号全部字节级一致。
 
+**推送时账号必须是真的 handle。** `kernels/push` 的 slug 由 `owner/kernel-slug` 拼成，
+owner 若是 `me`（hello 没探出账号时的兜底），Kaggle 回的是 `400 {"message":"A language must be specified."}`
+——它先校验 slug、再报下一条必填项，所以这句抱怨跟语言无关。现在的顺序是：
+`hello` 探到就用它，探不到就去 `kernels/list` 反查 Key 名下第一个内核的 `ownerSlug`，
+两条都空就**不推**，直接说"把 handle 填进用户名那格"，而不是推个 `me/` 上去换一句听不懂的话。
+载荷里 `language` 同时写在 `source.language` 与 `source.slug.language`，`name`/`id` 成对给。
+
 ## 已知边界
 
 - **首次要等**：装环境 + 17GB 权重约 10-15 分钟，这不是 APK 能优化的部分。
