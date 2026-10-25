@@ -421,14 +421,17 @@ public class MainActivity extends Activity {
         if (force) log("上次被云端挡下，清掉缓存地址重新握手");
         if (!base.isEmpty()) {
             try {
-                JSONObject h = Kaggle.probe(base, token);
-                if (h.optBoolean("ok") && h.optBoolean("auth", true)) {
-                    ui.post(() -> {
-                        tvCloud.setText("云端在线 · " + base.replace("https://", ""));
-                        setStatus("在线", Ui.ACCENT);
-                    });
-                    return;
+                // 缓存里的令牌可能是旧会话的：让 handshake 校准，别为了过期令牌去惊动 Kaggle
+                final String good = Kaggle.handshake(base, token);
+                if (!good.equals(token)) {
+                    log("令牌已按云端现时的校准，不用重填 Key");
+                    sp.edit().putString("token", good).apply();
                 }
+                ui.post(() -> {
+                    tvCloud.setText("云端在线 · " + base.replace("https://", ""));
+                    setStatus("在线", Ui.ACCENT);
+                });
+                return;
             } catch (Exception e) {
                 log("旧地址失效，重新拉起云端（能连上就不用管 Key）");
             }
@@ -543,7 +546,7 @@ public class MainActivity extends Activity {
                     setStatus("云端 401", 0xFFE05B5B);
                     log("  云端不认这个令牌，跟你的 Kaggle Key 无关");
                     if (!rehandshake && !cancelled.get()) {
-                        log("  自动重来一次：丢掉旧地址与旧令牌，重新握手");
+                        log("  自动重来一次：先校准令牌，不行再丢掉旧地址重新握手");
                         resetBtn();
                         new android.os.Handler(android.os.Looper.getMainLooper())
                                 .postDelayed(() -> generate(true), 1200);

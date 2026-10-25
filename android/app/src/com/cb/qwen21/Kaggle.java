@@ -30,7 +30,9 @@ final class Kaggle {
     static final String HOST = "https://www.kaggle.com";
     static final String SLUG = "qwen-image-2-1-uncensored-int8-serve";
     /** 内核代码版本。改了 notebook 就要 +1，否则手机上旧版会一直复用旧内核。 */
-    static final int REV = 4;
+    static final int REV = 5;
+    /** 与云端 qwen_setup.py 的 REV 同一份稳定令牌：云端换代码、手机没换包时也能进。 */
+    static final String DEVICE_TOKEN = "QW21-REV5";
 
     private final String user, key;
 
@@ -54,21 +56,57 @@ final class Kaggle {
         JSONObject json() throws Exception { return new JSONObject(text()); }
     }
 
-    private HttpURLConnection open(String url, String method) throws Exception {
+    /**
+     * 凭据怎么带。Kaggle 对「旧式 key + Basic」和「KGAT_ 令牌」挑得不一样，
+     * 401 时换下一个再试——总比让人回去重填一个字都没错的 Key 强。
+     */
+    private String[][] authModes() {
+        if (isToken(key)) {
+            return new String[][]{
+                    {"Authorization", "Bearer " + key},
+                    {"Authorization", "Basic " + Auth.b64(user + ":" + key)},
+            };
+        }
+        return new String[][]{
+                {"Authorization", "Basic " + Auth.b64(user + ":" + key)},
+                {"Authorization", "Bearer " + key},
+        };
+    }
+
+    /** 哪些接口已经试出「该换一种带法」，避免每次 401 都白跑一趟。 */
+    private static final java.util.Set<String> AUTH_URLS = new java.util.HashSet<>();
+
+    private HttpURLConnection open(String url, String method, String[] mode) throws Exception {
         HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
         c.setRequestMethod(method);
         c.setConnectTimeout(20000);
         c.setReadTimeout(60000);
         c.setInstanceFollowRedirects(true);
-        // 用户名还没探出来就先只发 key，Basic 的账号位留空：Kaggle 按 key 认人。
+        // 用户名还没探出来就先只发凭据本身，Basic 的账号位留空：Kaggle 按 key 认人。
         // 别在这里拿 "me" 当账号发上去——hello 自己都不认这个名字。
-        c.setRequestProperty("Authorization", "Basic " + Auth.b64(user + ":" + key));
+        c.setRequestProperty(mode[0], mode[1]);
         c.setRequestProperty("User-Agent", "Qwen21APK/2.0");
         return c;
     }
 
     private Res call(String url, String method, byte[] body, String ctype) throws Exception {
-        HttpURLConnection c = open(url, method);
+        Res r = callOnce(url, method, body, ctype, authModes()[0]);
+        if (r.code == 401 || r.code == 403) {
+            String[] alt = authModes()[1];
+            Res r2 = callOnce(url, method, body, ctype, alt);
+            if (r2.code < 400) {
+                // 换对了：记住这条接口的带法，下次直接用
+                synchronized (AUTH_URLS) { AUTH_URLS.add(url); }
+                return r2;
+            }
+            // 两种带法都被拒，把"看起来更像真的"那条报出去
+            return r2;
+        }
+        return r;
+    }
+
+    private Res callOnce(String url, String method, byte[] body, String ctype, String[] mode) throws Exception {
+        HttpURLConnection c = open(url, method, mode);
         if (body != null) {
             c.setDoOutput(true);
             c.setRequestProperty("Content-Type", ctype == null ? "application/json" : ctype);
@@ -202,7 +240,7 @@ final class Kaggle {
         JSONObject s = new JSONObject();
         s.put("id", kernelRef(owner));
         s.put("title", "Qwen Image 2.1 Uncensored INT8 Serve (r" + REV + ")");
-        s.put("code", Auth.b64(new String(Kernel.notebook(), StandardCharsets.UTF_8)));
+        s.put("code", Auth.b64(Kernel.notebook()));
         s.put("language", "python");
         s.put("kernelType", "notebook");
         s.put("isPrivate", true);
@@ -286,7 +324,7 @@ final class Kaggle {
         if (r.code >= 400) return "";
         String ct = "";
         try {
-            HttpURLConnection c = open(url, "GET");
+            HttpURLConnection c = open(url, "GET", authModes()[0]);
             ct = String.valueOf(c.getContentType());
             c.disconnect();
         } catch (Exception ignore) {}
@@ -359,6 +397,33 @@ final class Kaggle {
         return new JSONObject(a.get("/qwen/health?token=" + Api.enc(token)));
     }
 
+    /**
+     * 探活并顺带把令牌校准好。返回的 token 是云端现时认的那个。
+     *
+     * 设备令牌有两种来源：内核日志里那条 ready（可能是上一会话留下的旧值）、
+     * 隧道上的 /qwen_token.txt（服务端每次启动覆盖写入）。哪个能用就用哪个，
+     * 都不对就退回内置的稳定令牌——它跟着 REV 走，云端认、本地也知道。
+     * 拿不到"服务活着"才算失败：令牌过期不该让人以为整台机器没醒。
+     */
+    static String handshake(String base, String token) throws Exception {
+        String[] cands = {token, DEVICE_TOKEN};
+        if (token == null || token.isEmpty()) cands = new String[]{DEVICE_TOKEN};
+        JSONObject last = null;
+        for (String t : cands) {
+            JSONObject h = probe(base, t);
+            if (h.optBoolean("auth")) return t;
+            last = h;
+        }
+        java.util.List<String> file = freshTokens(base);
+        for (String t : file) {
+            if (probe(base, t).optBoolean("auth")) return t;
+        }
+        if (last != null && !last.optBoolean("ok"))
+            throw new IllegalStateException("隧道通了但服务没醒：" + base);
+        // 服务活着、所有已知令牌都不认：照原样交出去，出图那一步会给出具体报错
+        return token == null || token.isEmpty() ? DEVICE_TOKEN : token;
+    }
+
     static class Progress {
         void stage(String s) {}
         void detail(String s) {}
@@ -370,6 +435,7 @@ final class Kaggle {
         if (url == null || url.isEmpty()) return false;
         try {
             JSONObject h = probe(url, token);
+            // ok 现在专指"服务活着"，auth 才是令牌对不对；老云端只回 ok 时按老规矩读
             return h.optBoolean("ok") && h.optBoolean("auth", true);
         } catch (Exception e) {
             return false;
@@ -381,21 +447,24 @@ final class Kaggle {
      * 服务端会把当前令牌写在 /kaggle/working/qwen_token.txt，暴露在隧道根路径下。
      * 这样设备令牌轮换（会话交班）后手机不用等人重装 APK。
      */
-    static String freshToken(String base, String old) {
-        if (base == null || base.isEmpty()) return "";
+    static java.util.List<String> freshTokens(String base) {
+        java.util.List<String> out = new java.util.ArrayList<>();
+        if (base == null || base.isEmpty()) return out;
         try {
             HttpURLConnection c = (HttpURLConnection) new URL(base + "/qwen_token.txt").openConnection();
             c.setConnectTimeout(10000);
             c.setReadTimeout(10000);
             c.setRequestProperty("User-Agent", "Qwen21APK/2.0");
-            if (c.getResponseCode() >= 400) return "";
-            String t = new String(Api.readBytes(c.getInputStream()), StandardCharsets.UTF_8).trim();
+            if (c.getResponseCode() >= 400) return out;
+            String text = new String(Api.readBytes(c.getInputStream()), StandardCharsets.UTF_8);
             c.disconnect();
-            if (t.isEmpty() || t.length() > 200) return "";
-            return t;
-        } catch (Exception e) {
-            return "";
+            for (String line : text.split("\\r?\\n")) {
+                String t = line.trim();
+                if (!t.isEmpty() && t.length() <= 200 && !out.contains(t)) out.add(t);
+            }
+        } catch (Exception ignore) {
         }
+        return out;
     }
 
     /**
@@ -448,30 +517,17 @@ final class Kaggle {
             if (!url.isEmpty()) {
                 p.stage("公网地址就绪，探活中");
                 try {
-                    JSONObject h = probe(url, token);
-                    if (h.optBoolean("ok") && h.optBoolean("auth", true)) {
-                        Map<String, String> out = new LinkedHashMap<>();
-                        out.put("url", url);
-                        out.put("token", token);
-                        out.put("owner", owner);
-                        out.put("gpu", hub.optString("gpu", ""));
-                        out.put("egress", hub.optString("egress", ""));
-                        return out;
-                    }
-                    // 地址通了、令牌对不上：说明日志里那条 ready 是上一会话留下的旧令牌。
-                    // 这次探活本身已经证明隧道活着，所以把云端现在认的令牌一起交出去。
-                    String fresh = freshToken(url, token);
-                    if (!fresh.isEmpty() && !fresh.equals(token)) {
-                        Map<String, String> out = new LinkedHashMap<>();
-                        out.put("url", url);
-                        out.put("token", fresh);
-                        out.put("owner", owner);
-                        out.put("gpu", hub.optString("gpu", ""));
-                        out.put("egress", hub.optString("egress", ""));
-                        p.detail("令牌已按云端现时的重签");
-                        return out;
-                    }
-                    p.detail("地址已下发，服务还没醒");
+                    // 日志里那条 ready 带的令牌可能是上一会话的旧值，交给 handshake 校准
+                    String good = handshake(url, token);
+                    Map<String, String> out = new LinkedHashMap<>();
+                    out.put("url", url);
+                    out.put("token", good);
+                    out.put("owner", owner);
+                    out.put("gpu", hub.optString("gpu", ""));
+                    out.put("egress", hub.optString("egress", ""));
+                    out.put("rev", String.valueOf(hub.optInt("rev", 0)));
+                    if (!good.equals(token)) p.detail("令牌已按云端现时的校准");
+                    return out;
                 } catch (Api.AuthError ae) {
                     // 隧道层面 401（cloudflared 白名单 / 网关）：不是 Key 的问题
                     p.detail("云端网关回 " + ae.getMessage() + "，继续等新地址");

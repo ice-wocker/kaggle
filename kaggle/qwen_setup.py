@@ -252,8 +252,10 @@ def install_crypto_node(seed):
     d = os.path.join(COMFY, "custom_nodes", "comfy_node_crypt")
     os.makedirs(d, exist_ok=True)
     # 节点文件 = 模板 + 模块级算法，保证两处永远同源
+    # 认的令牌有两个：REV 里写死的稳定值（APK 内置同一份），和 seed 派生值。
+    # 端上手上是哪个都能进——鉴权只为挡住乱敲的人，不为难自己。
     node_src = (CRYPT_NODE_SRC_TEMPLATE.replace("@@ALGO@@", ALGO_SRC)
-                .replace("@@TOKEN@@", make_token(seed))
+                .replace("@@TOKENS@@", repr(sorted(CLOUD_TOKENS)))
                 .replace("@@SEED@@", seed)
                 .replace("@@UNET@@", UNET_NAME)
                 .replace("@@CLIP@@", CLIP_NAME)
@@ -664,22 +666,32 @@ try:
         }
         return g
 
+    TOKENS = set(@@TOKENS@@)
+
+    def _given(request, body):
+        # body["t"] 是信封本体，不是凭据：令牌只认请求头、查询串或 body["k"]
+        h = request.headers
+        return (h.get("X-QWEN-TOKEN")
+                or (h.get("Authorization") or "").replace("Bearer ", "").replace("bearer ", "").strip()
+                or request.query.get("token")
+                or (body or {}).get("k") or "")
+
     def _auth(request, body):
-        # body["t"] 是信封本体，不是凭据：令牌只认请求头或 body["k"]
-        return (request.headers.get("X-QWEN-TOKEN") or body.get("k") or "") == "@@TOKEN@@"
+        return _given(request, body) in TOKENS
 
     @PromptServer.instance.routes.get("/qwen/health")
     async def _qwen_health(request):
-        tok = request.query.get("token") or (request.headers.get("X-QWEN-TOKEN") or "")
-        ok = (tok == "@@TOKEN@@")
-        return web.json_response({"ok": ok, "node": "comfy_node_crypt", "auth": ok,
+        # ok 是"服务活着"（不带令牌也看得出来），auth 才是"令牌对上没有"。
+        # 以前只回一个 ok，端上探活失败分不清是服务没醒还是令牌过期。
+        ok = _auth(request, None)
+        return web.json_response({"ok": True, "node": "comfy_node_crypt", "auth": ok,
                                   "queue": len(_srv.PromptServer.instance.prompt_queue.get_current_queue()[0])})
 
     @PromptServer.instance.routes.post("/qwen/generate")
     async def _qwen_generate(request):
         body = await request.json()
         if not _auth(request, body):
-            return web.json_response({"error": "unauthorized"}, status=401)
+            return web.json_response({"error": "unauthorized", "got": len(_given(request, body))}, status=401)
         raw = base64.b64decode(body.get("t") or b"")
         try:
             f = _unpack(raw)
@@ -932,7 +944,7 @@ def start_tunnel(port=8188):
         exit_ip = urllib.request.urlopen("https://api.ipify.org", timeout=8).read().decode().strip()
     except Exception:
         exit_ip = ""
-    publish("ready", "服务在线", url=url, gpu=GPU_NAME_GLOBAL[0], egress=exit_ip)
+    publish("ready", "服务在线", url=url, gpu=GPU_NAME_GLOBAL[0], egress=exit_ip, rev=REV)
     mark(f"serve: 公网地址 {url}")
     return url
 
@@ -1069,6 +1081,11 @@ def upload_probe(tag):
     return back == data
 
 
+# 设备令牌。REV 是写死的稳定值（APK 内置同一份），make_token() 是 seed 派生值。
+# 两个都认：换了云端代码而手机没换包时，旧包手上那个也能进。
+REV = 5
+CLOUD_TOKENS = {"QW21-REV%d" % REV, make_token(SEED_GLOBAL)}
+
 # 令牌落盘处：self-resume 时读回上一次的进度（只在卷上，不对外暴露）
 TOKEN_FILE = "/kaggle/working/qwen_token.txt"
 
@@ -1084,10 +1101,11 @@ def write_token_file():
     try:
         web = os.path.join(COMFY, "web")
         os.makedirs(web, exist_ok=True)
-        with open(os.path.join(web, "qwen_token.txt"), "w") as f:
-            f.write(make_token(SEED_GLOBAL))
-        with open(TOKEN_FILE, "w") as f:
-            f.write(make_token(SEED_GLOBAL))
-        print("/qwen_token.txt 已就位", flush=True)
+        # 一行一个，手机全拿去挨个试；顺序无所谓
+        text = "\n".join(sorted(CLOUD_TOKENS)) + "\n"
+        for path in (os.path.join(web, "qwen_token.txt"), TOKEN_FILE):
+            with open(path, "w") as f:
+                f.write(text)
+        print("/qwen_token.txt 已就位:", sorted(CLOUD_TOKENS), flush=True)
     except Exception as e:
         print("写令牌文件失败（不影响出图）:", e, flush=True)

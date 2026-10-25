@@ -36,6 +36,17 @@ T4 16G 够用：diffusion 进显存，TE 走 RAM——编码只发生一次，�
 cd kaggle && kaggle kernels push
 ```
 
+云端逻辑只写在 `kaggle/qwen_setup.py`（全部逻辑）+ `kaggle/run_notebook.py`（启动序列）里，
+`notebook.ipynb` 与 APK 内置的那份 `Kernel.java` 都是生成的：
+
+```bash
+python3 kaggle/gen_kernel.py           # 重新生成 ipynb + Kernel.java
+python3 kaggle/gen_kernel.py --check   # 校验两份产物是否与源码同源
+```
+
+别手改 `.ipynb`。以前两边各存一份拷贝，改了一边另一边还是旧的，
+结果是「脚本改了、手机上推上去的仍是老云端代码」。
+
 加速器 **GPU T4**，Internet 打开。跑起来后依次做：装环境 → 拉权重 → 起 ComfyUI →
 装加密节点 → 闭环自检（密文图 + 任务信封双向验证）→ 开公网隧道 → 把地址发布到日志。
 
