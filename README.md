@@ -72,7 +72,10 @@ QWEN21://<base64url({"kind":"ready","url":"https://xxxx.trycloudflare.com","toke
 
 ## APK（已编译，直接装）
 
-安装包在仓库里：**[`apk/qwen-image-2.1-oneclick.apk`](apk/qwen-image-2.1-oneclick.apk)**（81 KB，minSdk 24，已签名）。
+安装包在仓库里：**[`apk/qwen-image-2.1-oneclick.apk`](apk/qwen-image-2.1-oneclick.apk)**（1.4 / versionCode 5，100 KB，minSdk 24，v2+v3 双方案签名）。
+
+装前可核对：`sha256sum apk/qwen-image-2.1-oneclick.apk` 应与同目录 `.sha256` 文件一致 ——
+不一致说明包在传输路上被动过，别装。
 
 **装好只需要填一个 Kaggle API Key。** 没有云端地址，没有口令，没有 push 命令，没有构建脚本。
 
@@ -109,8 +112,10 @@ QWEN21://<base64url({"kind":"ready","url":"https://xxxx.trycloudflare.com","toke
 cd android && ./build.sh
 ```
 
-只要机器上有 `javac`，SDK 缺失会自动下载到 `android/.sdk/`，产出直接覆盖 `apk/` 里那一份。
+只要机器上有 `javac`（JDK 17 实测可用），SDK 缺失会自动下载到 `android/.sdk/`，产出直接覆盖 `apk/` 里那一份。
 签名用固定的 `android/.keystore`（首次自动生成），所以升级安装不会因签名变化被系统拒掉。
+`build.sh` 签名后会先跑 `apksigner verify`，验不过就直接失败退出、不覆盖 `apk/` 里那一份 ——
+装不上的包不该进仓库，这个错误该留在构建机上，而不是留给装它的人。
 
 ## 9 张一起跑
 

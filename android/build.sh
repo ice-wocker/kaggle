@@ -73,8 +73,18 @@ PY
 "$BT/zipalign" -f -p 4 app.apk app-aligned.apk
 mkdir -p "$(dirname "$OUT")"
 "$BT/apksigner" sign --ks "$KS" --ks-pass pass:android --key-pass pass:android \
-  --ks-key-alias androiddebugkey --v1-signing-enabled true --min-sdk-version 24 \
-  --out "$OUT" app-aligned.apk
+  --ks-key-alias androiddebugkey --v1-signing-enabled true --v2-signing-enabled true \
+  --min-sdk-version 24 --out "$WORK/signed.apk" app-aligned.apk
+
+# 先验签、再落盘：装不上的包不该出现在仓里。
+# 手机只认真实签过名的包，编完却不验，等于把「装不上」这个错误留给用户去发现。
+if ! "$BT/apksigner" verify "$WORK/signed.apk"; then
+  echo "!! 签名校验没过，不发布: $WORK/signed.apk" >&2
+  exit 1
+fi
+mkdir -p "$(dirname "$OUT")"
+cp "$WORK/signed.apk" "$OUT"
 "$BT/apksigner" verify --print-certs "$OUT" | head -2
+sha256sum "$OUT" | tee "$OUT.sha256"
 ls -lh "$OUT"
 echo "OK -> $OUT"
