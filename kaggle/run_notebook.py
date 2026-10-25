@@ -17,8 +17,9 @@ LIMIT_HOURS = float(os.environ.get("QWEN21_LIMIT_HOURS", "11.5"))
 STAGE = "init"
 STAGE_GLOBAL[0] = STAGE
 # 先举手：端上等的是 QWEN21:// 这一行，不是 print。内核刚被拉起时最先要看到的是
-# 「云朵收到了」，而不是一片空白的「等待云端日志」。
-emit()
+# 「收到了」，而不是一片空白的「等云端开口」。顺手把会话状态一起带上，
+# 端上就不用再猜（也就不用再打那条不存在的 status 接口）。
+emit(**session_facts())
 
 
 def stage(name):
@@ -37,7 +38,13 @@ try:
     publish("stage", "gpu", note=GPU_NAME_GLOBAL[0])
 
     stage("install")
-    install()
+    try:
+        install()
+    except Exception as e:
+        # 装依赖失败别只留一句 AssertionError：把真原因写出去，端上立刻停在「安装 ComfyUI」
+        # 并显示这句话，不再空等 25 分钟。
+        publish("error", "install", detail=str(e)[:600])
+        raise
 
     stage("download")
     download_models()

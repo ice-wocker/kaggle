@@ -146,14 +146,23 @@ def install():
              "comfyui-embedded-docs": "comfyui_embedded_docs", "blake3": "blake3",
              "simpleeval": "simpleeval", "av": "av", "comfy-angle": "comfy_angle"}
 
-    def _probe(line):
-        """返回 (导入名, 是否已装)。"""
+    def _probe(line, deep=False):
+        """返回 (导入名, 是否已装)。deep=True 时真的 import，连包内的二级 import 也查出来。"""
         raw = re.split(r"[=<>\[!~ ;]", line, 1)[0].strip().lower()
         mod = NAMES.get(raw) or raw.replace("-", "_")
         try:
-            return mod, importlib.util.find_spec(mod) is not None
+            if importlib.util.find_spec(mod) is None:
+                return mod, False
         except (ImportError, ValueError, AttributeError):
             return mod, False
+        if deep:
+            try:
+                import importlib as _il
+                _il.import_module(mod)
+            except Exception as e:
+                print(f"import {mod} 失败: {e}", flush=True)
+                return mod, False
+        return mod, True
 
     missing = []
     for line in reqs:
@@ -168,9 +177,21 @@ def install():
         mark(f"install: 补装 ComfyUI 要求里缺的 {len(missing)} 项，含 comfy-aimdo/comfy-kitchen 这类硬依赖")
         print("缺:", names, flush=True)
         shout(f"pip 装 {len(missing)} 个包：" + " ".join(names[:8]))
-        sh(f"{sys.executable} -m pip install -q --no-warn-script-location " + " ".join(missing),
+        # 显式落到 user site（~/.local/lib/...）：Kaggle 每个镜像的 site-packages 布局不一样，
+        # 上次就是装到了这个进程 import 不到的地方，检查过了、ComfyUI 照样起不来。
+        sh(f"{sys.executable} -m pip install -q --no-warn-script-location --user " + " ".join(missing),
            log=pip_log)
-        still = [line for line in missing if not _probe(line)[1]]
+        # find_spec 只查 sys.path，不 import。pip 已经把目录写进 site-packages 了，
+        # 但这个进程的 sys.path 还是启动时那份，新装的包 import 不进来——
+        # 于是检查全过、ComfyUI 一启动就 ModuleNotFoundError。这里把新目录补进去，
+        # 再真的 import 一次，别让「装上了」和「导得进」差了半个身位。
+        import site
+        for d in site.getsitepackages() + [site.getusersitepackages()]:
+            if os.path.isdir(d) and d not in sys.path:
+                sys.path.insert(0, d)
+        importlib.invalidate_caches()
+        # 复查要真 import：find_spec 过了但二级依赖缺失的情况，只有 import 才炸得出来
+        still = [line for line in missing if not _probe(line, deep=True)[1]]
         if still:
             # 静默失败最贵：什么都不说，然后 6 分钟后报「启动超时」。
             raise RuntimeError("依赖装完仍导不进: %s\n" % [s.split("=")[0] for s in still]
@@ -269,7 +290,18 @@ def start_comfy(extra_args=""):
     env = dict(os.environ, PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True")
     cmd = f"cd {COMFY} && nohup {sys.executable} main.py {args} >> {log} 2>&1 &"
     print(">>>", cmd, flush=True)
-    proc = subprocess.Popen(cmd, shell=True, env=env)
+    # 起之前先用同一个解释器导一次那两个硬依赖。启动失败要等 6 分钟才看得见，
+    # 这一行只花半秒，却能把 ModuleNotFoundError 当场说出来。
+    for mod in ("comfy_aimdo.control", "comfy_kitchen"):
+        try:
+            subprocess.run([sys.executable, "-c", f"import {mod}"], check=True,
+                           capture_output=True, timeout=120)
+        except Exception as e:
+            print(f"启动前自检失败: import {mod} -> {e}", flush=True)
+            print(tail_log(os.path.join(LOG_DIR, "pip.log"), 40), flush=True)
+            return False
+    proc = subprocess.Popen(cmd, shell=True, env=env,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     write_token_file()
     for i in range(180):
         time.sleep(2)
@@ -282,9 +314,12 @@ def start_comfy(extra_args=""):
         # 每 30 秒说一句：这段时间最长 6 分钟没日志，端上会以为卡死
         if i and i % 15 == 0:
             shout(f"等 ComfyUI 起来 · {2 * i}s")
+            # 每 30 秒把「还在等、进程活着」写进日志：端上据此判断是慢还是死
+            publish("stage", "start-comfy", note=f"等待中 {2 * i}s")
         # 进程已经死了就别再等那 6 分钟：直接把真错误报出来。
         # 上一版没这一条，ModuleNotFoundError 被埋成「启动超时」，日志里全是 alembic 噪音。
         if proc.poll() is not None:
+            print(f"ComfyUI 进程 {2*(i+1)}s 内退出（退出码 {proc.returncode}）", flush=True)
             break
     print("ComfyUI start failed/timeout, tail log:", flush=True)
     os.system(f"tail -60 {log}")
@@ -899,6 +934,34 @@ def save_version():
         return False
 
 
+def session_facts():
+    """顶替端上去问 Kaggle：这个内核现在什么状态、排在几号。
+
+    以前手机侧的「会话状态」来自一条根本不存在的接口（404+HTML 被当成"没在线"），
+    于是每一轮都判成不在线、每轮都 push 一次。与其让端上猜，不如内核自己说：
+    它跑得起来的时候就看得见自己的会话，排队中就把 Queue 位置的影子写进日志。
+    """
+    facts = {"status": "RUNNING"}
+    try:
+        import requests
+        tok = os.environ.get("KAGGLE_API_TOKEN") or os.environ.get("KAGGLE_KEY") or ""
+        hdr = {"Authorization": "Bearer " + tok} if tok.startswith("KGAT_") else {}
+        owner, slug = KERNEL_SLUG.split("/", 1)
+        r = requests.post("https://api.kaggle.com/v1/kernels.KernelsApiService/GetKernelSessionStatus",
+                          json={"userName": owner, "kernelSlug": slug}, headers=hdr, timeout=15)
+        if r.status_code == 200:
+            d = r.json() or {}
+            if d.get("status"):
+                facts["status"] = d["status"]
+            if d.get("failureMessage"):
+                facts["failure"] = str(d["failureMessage"])[:200]
+            if d.get("queuePosition") is not None:
+                facts["queue"] = str(d["queuePosition"])
+    except Exception as e:
+        facts["statusError"] = str(e)[:120]
+    return facts
+
+
 def stop_self():
     """自停：Kaggle 交互会话里有 stop 接口，静默失败也无所谓（等它自然超时）。"""
     try:
@@ -951,6 +1014,8 @@ SEED_GLOBAL = "qwen21unc2026"
 
 def publish(kind, msg="", **extra):
     payload = {"kind": kind, "stage": msg or STAGE_GLOBAL[0]}
+    # 顺手带一份心跳：端上判断「云端有没有在动」看 ts，不用每 6 秒问一次 Kaggle
+    payload.setdefault("beat", int(time.time()))
     payload.update(extra)
     try:
         _publish(payload)
@@ -1207,19 +1272,19 @@ def probe_image(prefix="ready", steps=6):
 
 # 设备令牌。REV 是写死的稳定值（APK 内置同一份），make_token() 是 seed 派生值。
 # 两个都认：换了云端代码而手机没换包时，旧包手上那个也能进。
-REV = 7
+REV = 8
 CLOUD_TOKENS = {"QW21-REV%d" % REV, make_token(SEED_GLOBAL)}
 
 
-def emit():
-    """立刻把当前 stage 打进日志。
+def emit(**extra):
+    """立刻把当前 stage 打进日志，顺手带上会话的真相（状态 / 排队位置）。
 
     端上只认 QWEN21:// 那几行。第一次举手要等第一个 mark 才发生，
-    中间的 pkg 探测、GPU 查询全是静默的——手机上就是「等待云端日志」。
-    这里把开局这一行提前发出去：不是给机器看，是给人看「云朵收到了」。
+    中间的 pkg 探测、GPU 查询全是静默的——手机上就是「等云端开口」。
+    这里把开局这一行提前发出去：不是给机器看，是给人看「收到了」。
     """
     try:
-        publish("stage", STAGE_GLOBAL[0])
+        publish("stage", STAGE_GLOBAL[0], **extra)
     except Exception:
         pass
 
