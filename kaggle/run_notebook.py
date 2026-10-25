@@ -43,7 +43,8 @@ try:
     install_crypto_node(SEED)
 
     stage("start-comfy")
-    assert start_comfy(), "ComfyUI 启动失败"
+    # 起不来时把 comfy.log 的思路给出来：绝大多数是依赖缺一个硬 import 的包。
+    assert start_comfy(), "ComfyUI 启动失败（看下面 comfy.log 尾部，通常是 ModuleNotFoundError）"
 
     stage("check-nodes")
     oi = api("/object_info")

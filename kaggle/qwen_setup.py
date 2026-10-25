@@ -104,32 +104,59 @@ def install():
 
     with open(os.path.join(COMFY, "requirements.txt")) as f:
         lines = [l.strip() for l in f if l.strip() and not l.startswith("#")]
-    # 只跳过镜像自带的 torch / torchvision（重装会拉 CUDA 轮子覆盖环境）。
-    # torchsde、torchvision 之外的小包照装 —— 少装一个就起不来。
-    def _preinstalled(line):
+
+    # 只跳过 torch（镜像自带 cu12x 轮子，重装会覆盖成别的 CUDA 版本）。
+    # 别的一律照装 —— 包括 comfy-aimdo / comfy-kitchen 这种带 C 扩展的小包：
+    # main.py 第 79 行 import comfy_aimdo.control 是无保护的硬 import，
+    # 少一个就整进程起不来，症状是「起 ComfyUI 超时 + ModuleNotFoundError」。
+    def _is_torch(line):
         name = re.split(r"[=<>\[!~ ]", line.lower(), 1)[0]
         return name in ("torch", "torchvision")
-    reqs = [l for l in lines if not _preinstalled(l)]
-    rf = os.path.join(WORK, "reqs.txt")
-    open(rf, "w").write("\n".join(reqs) + "\n")
+
+    reqs = [l for l in lines if not _is_torch(l)]
+    open(os.path.join(WORK, "reqs.txt"), "w").write("\n".join(reqs) + "\n")
     print(f"deps: {len(reqs)} 条（跳过 {len(lines) - len(reqs)} 条 torch*）", flush=True)
 
-    # 先只补镜像里缺的包，缺的少就装得快；缺得多再整批上。
-    need = ["torchsde", "einops", "transformers", "safetensors", "aiohttp",
-            "yaml", "PIL", "scipy", "tqdm", "psutil", "alembic", "sqlalchemy", "filelock"]
-    import importlib
-    missing = []
-    for m in need:
+    # 以前这里只查一张手写的 13 项清单，清单漏了谁谁就永远装不上：
+    # 镜像里没 comfy_aimdo，清单里也没它，于是每次都在 start-comfy 炸。
+    # 现在以 ComfyUI 自己的 requirements.txt 为准，逐个 import 探活。
+    import importlib.util
+    # 发行包名和导入名不一致的，查这张表；表里没有的按「包名里的 - 换成 _」猜，
+    # 猜错只会多装一次，不会漏装。
+    NAMES = {"pyyaml": "yaml", "pillow": "PIL", "pydantic-settings": "pydantic_settings",
+             "opencv-python": "cv2", "comfyui-frontend-package": "comfyui_frontend_package",
+             "comfyui-workflow-templates": "comfyui_workflow_templates",
+             "comfyui-embedded-docs": "comfyui_embedded_docs", "blake3": "blake3",
+             "simpleeval": "simpleeval", "av": "av", "comfy-angle": "comfy_angle"}
+
+    def _probe(line):
+        """返回 (导入名, 是否已装)。"""
+        raw = re.split(r"[=<>\[!~ ;]", line, 1)[0].strip().lower()
+        mod = NAMES.get(raw) or raw.replace("-", "_")
         try:
-            importlib.import_module(m)
-        except Exception:
-            missing.append(m)
-    pkg = {"yaml": "pyyaml", "PIL": "pillow"}
+            return mod, importlib.util.find_spec(mod) is not None
+        except (ImportError, ValueError, AttributeError):
+            return mod, False
+
+    missing = []
+    for line in reqs:
+        mod, ok = _probe(line)
+        if not ok:
+            missing.append(line)
+
+    # 包名里有 >= 的照原样喂给 pip，但别丢进日志行——那会把 markdown 弄乱。
+    names = [m.split("=")[0].split(">")[0].split("<")[0].strip() for m in missing]
     pip_log = os.path.join(LOG_DIR, "pip.log")
     if missing:
-        mark(f"install: 补装缺失模块 {missing}（不装 torch）")
-        sh(f"{sys.executable} -m pip install -q --no-warn-script-location "
-           + " ".join(pkg.get(m, m) for m in missing), log=pip_log)
+        mark(f"install: 补装 ComfyUI 要求里缺的 {len(missing)} 项，含 comfy-aimdo/comfy-kitchen 这类硬依赖")
+        print("缺:", names, flush=True)
+        sh(f"{sys.executable} -m pip install -q --no-warn-script-location " + " ".join(missing),
+           log=pip_log)
+        still = [line for line in missing if not _probe(line)[1]]
+        if still:
+            # 静默失败最贵：什么都不说，然后 6 分钟后报「启动超时」。
+            raise RuntimeError("依赖装完仍导不进: %s\n" % [s.split("=")[0] for s in still]
+                               + tail_log(pip_log))
     else:
         mark("install: 依赖已齐，跳过 pip")
 
@@ -222,7 +249,7 @@ def start_comfy(extra_args=""):
     env = dict(os.environ, PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True")
     cmd = f"cd {COMFY} && nohup {sys.executable} main.py {args} >> {log} 2>&1 &"
     print(">>>", cmd, flush=True)
-    subprocess.Popen(cmd, shell=True, env=env)
+    proc = subprocess.Popen(cmd, shell=True, env=env)
     write_token_file()
     for i in range(180):
         time.sleep(2)
@@ -232,7 +259,11 @@ def start_comfy(extra_args=""):
             return True
         except Exception:
             pass
-    print("ComfyUI start timeout, tail log:", flush=True)
+        # 进程已经死了就别再等那 6 分钟：直接把真错误报出来。
+        # 上一版没这一条，ModuleNotFoundError 被埋成「启动超时」，日志里全是 alembic 噪音。
+        if proc.poll() is not None:
+            break
+    print("ComfyUI start failed/timeout, tail log:", flush=True)
     os.system(f"tail -60 {log}")
     return False
 
