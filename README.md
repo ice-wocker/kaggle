@@ -106,7 +106,7 @@ QWEN21://<base64url({"kind":"ready","url":"https://xxxx.trycloudflare.com","toke
 
 ## APK（已编译，直接装）
 
-安装包在仓库里：**[`apk/qwen-image-2.1-oneclick.apk`](apk/qwen-image-2.1-oneclick.apk)**（1.4 / versionCode 5，125 KB，minSdk 24，v2+v3 双方案签名）。
+安装包在仓库里：**[`apk/qwen-image-2.1-oneclick.apk`](apk/qwen-image-2.1-oneclick.apk)**（1.5 / versionCode 6，125 KB，minSdk 24，v2+v3 双方案签名）。
 
 装前可核对：`sha256sum apk/qwen-image-2.1-oneclick.apk` 应与同目录 `.sha256` 文件一致 ——
 不一致说明包在传输路上被动过，别装。
@@ -219,12 +219,48 @@ CB 22 01 00 | len(2) | Feistel( b"Q2" | n × [klen key vlen type payload] )
 
 已做双向交叉验证：Java 码字 → Python 图 → Java 读回，以及反向；中英日韩 + emoji + 换行 + 符号全部字节级一致。
 
-**推送时账号必须是真的 handle。** `kernels/push` 的 slug 由 `owner/kernel-slug` 拼成，
-owner 若是 `me`（hello 没探出账号时的兜底），Kaggle 回的是 `400 {"message":"A language must be specified."}`
-——它先校验 slug、再报下一条必填项，所以这句抱怨跟语言无关。现在的顺序是：
-`hello` 探到就用它，探不到就去 `kernels/list` 反查 Key 名下第一个内核的 `ownerSlug`，
-两条都空就**不推**，直接说"把 handle 填进用户名那格"，而不是推个 `me/` 上去换一句听不懂的话。
-载荷里 `language` 同时写在 `source.language` 与 `source.slug.language`，`name`/`id` 成对给。
+### push 那句 `A language must be specified` 到底是什么
+
+它不是语言问题。真正的根因是**载荷结构**：我们发的是自己发明的嵌套壳
+
+```json
+{"slug": "...", "text": "", "isRetry": false,
+ "source": {"name": "...", "id": "...", "title": "...", "code": "<base64>",
+            "language": "python", "slug": {"language": "python"}}}
+```
+
+而 Kaggle 的 `ApiSaveKernelRequest` 是**扁平**的：`slug` / `text` / `language` /
+`kernelType` / `newTitle` / 三个开关，就这么几个键，没有 `source`。
+服务端读不到它认识的字段，就沿着必填项往下报，报到 `language` 上。
+于是所有人都在改 language——而 language 一直是对的，改了也没用。
+
+现在是官方结构：内核代码走 `text`（不是 `code`，不是 base64），
+不再有 `source` 壳，也不再往内层塞 `slug.language`。
+信封里的 `sessionEnv` 一并删掉：它不是这个接口的字段，云端本来也读不到，
+真正的凭据走 `KAGGLE_API_TOKEN` / `kaggle_secrets` 那条路。
+
+凭据怎么带也不再靠试：`KGAT_` 令牌 = `Bearer`，旧式 32 位 key = `Basic user:key`，
+跟官方 SDK 一致。「401 就换一种带法、换对了就记住」那套机制已经删掉——
+它不是聪明，是把载荷错误和账号错误都伪装成鉴权错误。
+
+端点主用 midtier 的 `v1/kernels.KernelsApiService/SaveKernel`（官方 CLI 走的就是这条），
+400 再退到 www 上的 `/api/v1/kernels/push`，两条发同一份扁平载荷。
+
+账号探不到时**不再推 `me`**：`resolveUser` 返回空串，调用方停下来说清楚缺 handle，
+而不是拼一个 `me/<slug>` 上去换一句听不懂的话。
+
+这条结论是拿官方 SDK 验的，不是猜的：`kaggle/test_push_payload.py` 会把
+`Kaggle.payload()` 真跑一遍（JVM 上），把产出的键与 `ApiSaveKernelRequest`
+的合法字段逐个对比。
+
+```bash
+python3 kaggle/test_push_payload.py                    # 结构断言，离线可跑
+python3 kaggle/test_push_payload.py --key KGAT_… --owner <handle>   # 再打真端点
+```
+
+有 `kagglesdk` 时它直接读官方类里的字段名做对比，没有就退回内置白名单。
+实测：12 个键全在官方 21 个合法字段里，两个端点对这份载荷都回 401（凭据问题）
+而不是 400（结构问题）——结构这一关过了。
 
 ## 装到设备上实测过
 
