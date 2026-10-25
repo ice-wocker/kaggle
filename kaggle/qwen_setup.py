@@ -32,6 +32,11 @@ MODELS = {
     "text_encoders": [(BASE_MODEL_REPO, "text_encoders/qwen3vl_8b_int8_convrot.safetensors")],
     "vae": [(BASE_MODEL_REPO, "vae/qwen_image_2.1_vae_bf16.safetensors")],
 }
+# 当前会话公布的隧道地址、出口 IP、GPU 名：常驻心跳要重播它们，所以放在全局
+SERVE_URL = [""]
+SERVE_IP = [""]
+GPU_NAME_GLOBAL = ["?"]
+
 UNET_NAME = "qwen-image-2.1-UC-int8_convrot.safetensors"
 CLIP_NAME = "qwen3vl_8b_int8_convrot.safetensors"
 VAE_NAME = "qwen_image_2.1_vae_bf16.safetensors"
@@ -53,6 +58,17 @@ def sh(cmd, log=None, check=False):
     if check and rc:
         raise RuntimeError(f"{cmd} -> rc={rc}")
     return rc
+
+
+def shout(msg):
+    """只打印、不上报的进度行。
+
+    日志是端上唯一的眼睛：它只认 QWEN21:// 里的 stage。以前 _fetch 每 20 秒
+    才打一行下载进度，git clone / aiohttp 往磁盘写的那段则是彻底的哑巴，
+    手机上看到的就是「等待云端日志」一秒一秒往上加、直到 1200 秒超时。
+    这里让云端在任何长耗时动作期间都别超过一两分钟不吭声。
+    """
+    print(f"[progress] {time.strftime('%H:%M:%S')} {msg}", flush=True)
 
 
 def mark(msg):
@@ -96,6 +112,7 @@ def install():
     # Kaggle 镜像自带 torch/numpy/transformers/aiohttp/pillow/safetensors/einops，
     # 所以不做 venv、不碰 torch：自定义节点只 import numpy/torch/PIL，用系统 Python 就够。
     # 重装 torch 会拉 CUDA 轮子覆盖镜像里的匹配版本，是上次最容易炸的一环。
+    shout("clone ComfyUI")
     sh(f"git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git {COMFY}",
        log=os.path.join(LOG_DIR, "setup.log"), check=False)
     if not os.path.isdir(os.path.join(COMFY, "comfy")):
@@ -104,32 +121,60 @@ def install():
 
     with open(os.path.join(COMFY, "requirements.txt")) as f:
         lines = [l.strip() for l in f if l.strip() and not l.startswith("#")]
-    # 只跳过镜像自带的 torch / torchvision（重装会拉 CUDA 轮子覆盖环境）。
-    # torchsde、torchvision 之外的小包照装 —— 少装一个就起不来。
-    def _preinstalled(line):
+
+    # 只跳过 torch（镜像自带 cu12x 轮子，重装会覆盖成别的 CUDA 版本）。
+    # 别的一律照装 —— 包括 comfy-aimdo / comfy-kitchen 这种带 C 扩展的小包：
+    # main.py 第 79 行 import comfy_aimdo.control 是无保护的硬 import，
+    # 少一个就整进程起不来，症状是「起 ComfyUI 超时 + ModuleNotFoundError」。
+    def _is_torch(line):
         name = re.split(r"[=<>\[!~ ]", line.lower(), 1)[0]
         return name in ("torch", "torchvision")
-    reqs = [l for l in lines if not _preinstalled(l)]
-    rf = os.path.join(WORK, "reqs.txt")
-    open(rf, "w").write("\n".join(reqs) + "\n")
+
+    reqs = [l for l in lines if not _is_torch(l)]
+    open(os.path.join(WORK, "reqs.txt"), "w").write("\n".join(reqs) + "\n")
     print(f"deps: {len(reqs)} 条（跳过 {len(lines) - len(reqs)} 条 torch*）", flush=True)
 
-    # 先只补镜像里缺的包，缺的少就装得快；缺得多再整批上。
-    need = ["torchsde", "einops", "transformers", "safetensors", "aiohttp",
-            "yaml", "PIL", "scipy", "tqdm", "psutil", "alembic", "sqlalchemy", "filelock"]
-    import importlib
-    missing = []
-    for m in need:
+    # 以前这里只查一张手写的 13 项清单，清单漏了谁谁就永远装不上：
+    # 镜像里没 comfy_aimdo，清单里也没它，于是每次都在 start-comfy 炸。
+    # 现在以 ComfyUI 自己的 requirements.txt 为准，逐个 import 探活。
+    import importlib.util
+    # 发行包名和导入名不一致的，查这张表；表里没有的按「包名里的 - 换成 _」猜，
+    # 猜错只会多装一次，不会漏装。
+    NAMES = {"pyyaml": "yaml", "pillow": "PIL", "pydantic-settings": "pydantic_settings",
+             "opencv-python": "cv2", "comfyui-frontend-package": "comfyui_frontend_package",
+             "comfyui-workflow-templates": "comfyui_workflow_templates",
+             "comfyui-embedded-docs": "comfyui_embedded_docs", "blake3": "blake3",
+             "simpleeval": "simpleeval", "av": "av", "comfy-angle": "comfy_angle"}
+
+    def _probe(line):
+        """返回 (导入名, 是否已装)。"""
+        raw = re.split(r"[=<>\[!~ ;]", line, 1)[0].strip().lower()
+        mod = NAMES.get(raw) or raw.replace("-", "_")
         try:
-            importlib.import_module(m)
-        except Exception:
-            missing.append(m)
-    pkg = {"yaml": "pyyaml", "PIL": "pillow"}
+            return mod, importlib.util.find_spec(mod) is not None
+        except (ImportError, ValueError, AttributeError):
+            return mod, False
+
+    missing = []
+    for line in reqs:
+        mod, ok = _probe(line)
+        if not ok:
+            missing.append(line)
+
+    # 包名里有 >= 的照原样喂给 pip，但别丢进日志行——那会把 markdown 弄乱。
+    names = [m.split("=")[0].split(">")[0].split("<")[0].strip() for m in missing]
     pip_log = os.path.join(LOG_DIR, "pip.log")
     if missing:
-        mark(f"install: 补装缺失模块 {missing}（不装 torch）")
-        sh(f"{sys.executable} -m pip install -q --no-warn-script-location "
-           + " ".join(pkg.get(m, m) for m in missing), log=pip_log)
+        mark(f"install: 补装 ComfyUI 要求里缺的 {len(missing)} 项，含 comfy-aimdo/comfy-kitchen 这类硬依赖")
+        print("缺:", names, flush=True)
+        shout(f"pip 装 {len(missing)} 个包：" + " ".join(names[:8]))
+        sh(f"{sys.executable} -m pip install -q --no-warn-script-location " + " ".join(missing),
+           log=pip_log)
+        still = [line for line in missing if not _probe(line)[1]]
+        if still:
+            # 静默失败最贵：什么都不说，然后 6 分钟后报「启动超时」。
+            raise RuntimeError("依赖装完仍导不进: %s\n" % [s.split("=")[0] for s in still]
+                               + tail_log(pip_log))
     else:
         mark("install: 依赖已齐，跳过 pip")
 
@@ -160,12 +205,12 @@ def _fetch(url, dst, chunk=8 << 20):
                 if not b:
                     break
                 f.write(b); done += len(b)
-                if time.time() - last > 20:
+                if time.time() - last > 10:
                     last = time.time()
                     mb = done / 1e6
                     sp = (done - have) / 1e6 / max(time.time() - t0, 1e-6)
                     pct = f"{100*done/total:.0f}%" if total else "?"
-                    print(f"  {os.path.basename(dst)} {pct} {mb:.0f}MB @ {sp:.1f}MB/s", flush=True)
+                    shout(f"下载 {os.path.basename(dst)} {pct} {mb:.0f}MB @ {sp:.1f}MB/s")
     size = os.path.getsize(tmp)
     if total and size < total:
         raise IOError(f"不完整 {size}/{total}")
@@ -193,11 +238,13 @@ def _one(sub, repo, fn):
 def download_models():
     """三个权重并行拉：16G 串行要十几分钟，并行能把这段压掉一大半。"""
     jobs = [(sub, repo, fn) for sub, items in MODELS.items() for repo, fn in items]
+    shout(f"开始拉 {len(jobs)} 件权重（合计约 17GB，走 hf-mirror）")
     errs = []
 
     def run(job):
         try:
-            _one(*job)
+            dst = _one(*job)
+            shout(f"权重就绪 {os.path.basename(dst)}")
         except Exception as e:  # noqa: BLE001 - 汇总后统一抛
             errs.append(e)
 
@@ -222,7 +269,7 @@ def start_comfy(extra_args=""):
     env = dict(os.environ, PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True")
     cmd = f"cd {COMFY} && nohup {sys.executable} main.py {args} >> {log} 2>&1 &"
     print(">>>", cmd, flush=True)
-    subprocess.Popen(cmd, shell=True, env=env)
+    proc = subprocess.Popen(cmd, shell=True, env=env)
     write_token_file()
     for i in range(180):
         time.sleep(2)
@@ -232,7 +279,14 @@ def start_comfy(extra_args=""):
             return True
         except Exception:
             pass
-    print("ComfyUI start timeout, tail log:", flush=True)
+        # 每 30 秒说一句：这段时间最长 6 分钟没日志，端上会以为卡死
+        if i and i % 15 == 0:
+            shout(f"等 ComfyUI 起来 · {2 * i}s")
+        # 进程已经死了就别再等那 6 分钟：直接把真错误报出来。
+        # 上一版没这一条，ModuleNotFoundError 被埋成「启动超时」，日志里全是 alembic 噪音。
+        if proc.poll() is not None:
+            break
+    print("ComfyUI start failed/timeout, tail log:", flush=True)
     os.system(f"tail -60 {log}")
     return False
 
@@ -699,7 +753,10 @@ try:
             return web.json_response({"error": "bad envelope: %s" % e}, status=400)
         wf = _build(f)
         pid = str(uuid.uuid4())
-        _TASKS[pid] = {"t0": _time.time()}
+        _TASKS[pid] = {"t0": _time.time(),
+                       "shape": "%sx%s/%s步/%s张" % (f.get("width"), f.get("height"),
+                                                     f.get("steps"), f.get("batch", 1)),
+                       "tip": ""}
         _srv.PromptServer.instance.prompt_queue.put((0, pid, wf))
         return web.json_response({"id": pid})
 
@@ -719,8 +776,17 @@ try:
         except Exception:
             hist = {}
         if not hist:
+            waited = _time.time() - info.get("t0", _time.time())
+            # 在跑却三分钟没产出，最典型的原因是 T4 显存不够、模型退回 CPU 硬算：
+            # 手机端看到的只是"转圈"，说实话比干等有用。
+            stuck = running and waited > 180 and not info.get("tip")
+            if stuck:
+                info["tip"] = "GPU 长时间无输出：16G 显存可能不够 1024x1024，试 768x768 或把张数改成 1"
             return web.json_response({"state": "running" if running else "queued",
-                                      "queue": len(cur[0]) if running else 0})
+                                      "queue": len(cur[0]) if running else 0,
+                                      "elapsed": round(waited, 1),
+                                      "shape": info.get("shape", ""),
+                                      "tip": info.get("tip", "")})
         e = hist[tid]
         st = e.get("status") or {}
         if st.get("status_str") == "error":
@@ -785,11 +851,21 @@ def wait_for_handoff(session_limit=11.5 * 3600, ticks=int(os.environ.get("QWEN21
     """
     t0 = time.time()
     n = 0
+    last_beat = 0
     while True:
         time.sleep(20)
         n += 1
         if n % 15 == 0:
             guard_alive()
+        # 心跳：每 5 分钟把地址再打一行。手机端第一次点按钮时隧道可能刚起来还没扫描到，
+        # 有这条重播就不用让人干等到下一次冷启动。
+        if time.time() - last_beat > 300:
+            last_beat = time.time()
+            try:
+                publish("ready", "服务在线", url=SERVE_URL[0], gpu=GPU_NAME_GLOBAL[0],
+                        egress=SERVE_IP[0], rev=REV, beat=int(time.time()))
+            except Exception:
+                pass
         st = _gate_state()
         if not st.get("auto", True):
             mark(f"handoff: 已被 {st.get('by', '?')} 接管，本会话退出")
@@ -944,12 +1020,13 @@ def start_tunnel(port=8188):
         exit_ip = urllib.request.urlopen("https://api.ipify.org", timeout=8).read().decode().strip()
     except Exception:
         exit_ip = ""
+    SERVE_URL[0] = url
+    SERVE_IP[0] = exit_ip
     publish("ready", "服务在线", url=url, gpu=GPU_NAME_GLOBAL[0], egress=exit_ip, rev=REV)
     mark(f"serve: 公网地址 {url}")
+    print(f"QWEN21 地址：{url}", flush=True)
     return url
 
-
-GPU_NAME_GLOBAL = ["?"]
 
 
 # ---------- ComfyUI API ----------
@@ -1081,10 +1158,71 @@ def upload_probe(tag):
     return back == data
 
 
+def probe_image(prefix="ready", steps=6):
+    """
+    真正跑一次采样，确认"出图"这条腿是通的，而不是只通了隧道和节点路由。
+
+    为什么值得花这 30 秒：int8 权重 + 某个 ComfyUI 版本对不上时，解码出来是
+    纯黑或全噪点，接口照样回"完成"，手机照样显示一张图。与其让人盯着黑图猜，
+    不如开机就自己跑一张，把亮度和像素方差写进日志。
+    """
+    w, h = 512, 512
+    wf = {
+        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": UNET_NAME, "weight_dtype": "default"}},
+        "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": CLIP_NAME, "type": "qwen_image", "device": "default"}},
+        "3": {"class_type": "VAELoader", "inputs": {"vae_name": VAE_NAME}},
+        "4": {"class_type": "TextEncodeQwenImage21",
+              "inputs": {"clip": ["2", 0], "prompt": "a red apple on a wooden table, soft daylight",
+                         "negative_prompt": "", "resolution": 1024}},
+        "5": {"class_type": "EmptyLatentImage", "inputs": {"width": w, "height": h, "batch_size": 1}},
+        "6": {"class_type": "KSampler", "inputs": {
+            "model": ["1", 0], "positive": ["4", 0], "negative": ["4", 1], "latent_image": ["5", 0],
+            "seed": 7, "steps": steps, "cfg": 1.0, "sampler_name": "euler", "scheduler": "simple",
+            "denoise": 1.0}},
+        "7": {"class_type": "VAEDecode", "inputs": {"samples": ["6", 0], "vae": ["3", 0]}},
+        "8": {"class_type": "SaveImage", "inputs": {"images": ["7", 0], "filename_prefix": prefix}},
+    }
+    r = run_wf(wf, timeout=1800, want_files=True)
+    if r.get("error"):
+        publish("error", "probe-image", detail=str(r["error"])[:600])
+        print("出图自检失败:", r["error"], flush=True)
+        return False
+    stat = {"shot": os.path.basename(r["images"][0].get("saved", "")) if r["images"] else "",
+            "elapsed": r.get("elapsed")}
+    try:
+        from PIL import Image as _I
+        import numpy as _np
+        arr = _np.asarray(_I.open(r["images"][0]["saved"]).convert("RGB")).astype("float32")
+        stat.update(bright=round(float(arr.mean()), 1), std=round(float(arr.std()), 1))
+        print("出图自检:", stat, flush=True)
+        if arr.std() < 2.0:
+            # 不 raise：图还是能出，只是可能不好看。把判断交给用户，别把整台机器判死。
+            publish("stage", "probe-image", note="图偏黑/纯色，INT8 权重可能与当前 ComfyUI 不匹配")
+            return False
+    except Exception as e:
+        print("出图自检统计失败:", e, flush=True)
+    publish("stage", "probe-image", note=json.dumps(stat, ensure_ascii=False))
+    return True
+
+
 # 设备令牌。REV 是写死的稳定值（APK 内置同一份），make_token() 是 seed 派生值。
 # 两个都认：换了云端代码而手机没换包时，旧包手上那个也能进。
-REV = 5
+REV = 7
 CLOUD_TOKENS = {"QW21-REV%d" % REV, make_token(SEED_GLOBAL)}
+
+
+def emit():
+    """立刻把当前 stage 打进日志。
+
+    端上只认 QWEN21:// 那几行。第一次举手要等第一个 mark 才发生，
+    中间的 pkg 探测、GPU 查询全是静默的——手机上就是「等待云端日志」。
+    这里把开局这一行提前发出去：不是给机器看，是给人看「云朵收到了」。
+    """
+    try:
+        publish("stage", STAGE_GLOBAL[0])
+    except Exception:
+        pass
+
 
 # 令牌落盘处：self-resume 时读回上一次的进度（只在卷上，不对外暴露）
 TOKEN_FILE = "/kaggle/working/qwen_token.txt"
