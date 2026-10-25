@@ -142,6 +142,67 @@ final class Crypto {
         return new String(decrypt(ct, key), StandardCharsets.UTF_8);
     }
 
+    // ---------- 任务信封：出图参数和提示词一起封进密文 ----------
+    // 上一版只有提示词进密文，步数/尺寸/种子还明文过网。现在整条指令一个信封。
+    /** typ: 0=bool 1=非负int 2=负int 3=double 4=字符串 */
+    private static byte[] fieldBytes(String k, Object v) {
+        byte[] kb = k.getBytes(StandardCharsets.UTF_8);
+        int typ;
+        byte[] raw;
+        if (v instanceof Boolean) {
+            typ = 0;
+            raw = new byte[]{(byte) (((Boolean) v) ? 1 : 0)};
+        } else if (v instanceof Number && !(v instanceof Double) && !(v instanceof Float)) {
+            long n = ((Number) v).longValue();
+            typ = n >= 0 ? 1 : 2;
+            long a = Math.abs(n);
+            raw = new byte[8];
+            for (int i = 7; i >= 0; i--) { raw[i] = (byte) (a & 0xFF); a >>>= 8; }
+        } else if (v instanceof Number) {
+            typ = 3;
+            long bits = Double.doubleToLongBits(((Number) v).doubleValue());
+            raw = new byte[8];
+            for (int i = 7; i >= 0; i--) { raw[i] = (byte) (bits & 0xFF); bits >>>= 8; }
+        } else {
+            typ = 4;
+            raw = String.valueOf(v).getBytes(StandardCharsets.UTF_8);
+        }
+        byte[] out = new byte[1 + kb.length + 2 + 1 + raw.length];
+        int o = 0;
+        out[o++] = (byte) kb.length;
+        System.arraycopy(kb, 0, out, o, kb.length); o += kb.length;
+        out[o++] = (byte) (raw.length >>> 8);
+        out[o++] = (byte) raw.length;
+        out[o++] = (byte) typ;
+        System.arraycopy(raw, 0, out, o, raw.length);
+        return out;
+    }
+
+    /** 值顺序与 key 一一对应；用 LinkedHashMap 保序。 */
+    static byte[] packTask(java.util.LinkedHashMap<String, Object> fields, byte[] key) {
+        int n = 2;
+        for (String k : fields.keySet()) n += fieldBytes(k, fields.get(k)).length;
+        byte[] inner = new byte[n];
+        inner[0] = 'Q';
+        inner[1] = '2';
+        int o = 2;
+        for (java.util.Map.Entry<String, Object> e : fields.entrySet()) {
+            byte[] f = fieldBytes(e.getKey(), e.getValue());
+            System.arraycopy(f, 0, inner, o, f.length);
+            o += f.length;
+        }
+        byte[] ct = encrypt(inner, key);
+        byte[] blob = new byte[6 + ct.length];
+        blob[0] = (byte) 0xCB;
+        blob[1] = 0x22;
+        blob[2] = 0x01;
+        blob[3] = 0x00;
+        blob[4] = (byte) (ct.length >>> 8);
+        blob[5] = (byte) ct.length;
+        System.arraycopy(ct, 0, blob, 6, ct.length);
+        return blob;
+    }
+
     static String hex(byte[] b) {
         StringBuilder sb = new StringBuilder();
         for (byte x : b) sb.append(String.format("%02x", x));

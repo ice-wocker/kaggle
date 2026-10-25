@@ -30,33 +30,51 @@ T4 16G 够用：diffusion 进显存，TE 走 RAM——编码只发生一次，�
 
 ## Kaggle 端
 
+一般不用手动跑，APK 会自己 push。想自己起或调试时：
+
 ```bash
-export KAGGLE_API_TOKEN=<你的 KGAT>
 cd kaggle && kaggle kernels push
 ```
 
-加速器选 **GPU T4**，Internet 打开。跑完自动做三件事：
+加速器 **GPU T4**，Internet 打开。跑起来后依次做：装环境 → 拉权重 → 起 ComfyUI →
+装加密节点 → 闭环自检（密文图 + 任务信封双向验证）→ 开公网隧道 → 把地址发布到日志。
 
-1. 加密节点闭环：`EncryptText` → 落盘密文图 → 从像素读回明文
-2. 上传/读取链路探针
-3. 真实出图（20 步，1024×1024）
+日志里那行是给手机看的：
 
-`main_cell.py` 里 `Mode = "serve"` 可切成常驻服务 + trycloudflare 隧道，浏览器也能用。
+```
+QWEN21://<base64url({"kind":"ready","url":"https://xxxx.trycloudflare.com","token":"QW21-…"})>
+```
+
+为什么走日志：Kaggle 没有「读某个 kernel 最新版本输出文件」的公开 API，但有日志。
+地址是唯一必须由云端告诉手机的变量（Quick Tunnel 每次重启都换域名）。
+想要固定域名，把 `NGROK_TOKEN` 放进 Kaggle Secrets，会自动优先走 ngrok。
+
+两个容易被忽略的设置：
+
+- **大件都放 /tmp**。Kaggle 保存版本时 output 有 ~20GB 上限，17GB 权重放在 working
+  会让保存直接失败，日志也跟着丢，自续跑就断了。
+- **依赖不重装**。镜像自带 torch/numpy/transformers/aiohttp/pillow/safetensors/einops，
+  自定义节点只用得到 numpy/torch/PIL，所以 `pip` 只补缺的那几个，绝不碰 torch。
 
 ## APK（已编译，直接装）
 
-安装包在仓库里：**[`apk/qwen-image-2.1-oneclick.apk`](apk/qwen-image-2.1-oneclick.apk)**（33 KB，minSdk 24，已签名）。
+安装包在仓库里：**[`apk/qwen-image-2.1-oneclick.apk`](apk/qwen-image-2.1-oneclick.apk)**（81 KB，minSdk 24，已签名）。
 
-不用自己跑构建。下载 → 装机 → 填云端地址 → 点「一键生成」。
+**装好只需要填一个 Kaggle API Key。** 没有云端地址，没有口令，没有 push 命令，没有构建脚本。
 
-装好后能做什么：
+点一次「一键出图」，手机自己干这些事：
 
-- **风格预设**：自动 / 写实摄影 / 电影感 / 日系插画 / 赛博朋克 / 胶片质感 / 3D 渲染 / 线稿上色
-- **NSFW 开关**（默认开）：开时会自动从你的负面词里剥掉 `nsfw`/`nude`/`裸露` 这类自我审查项，留空则填一套只压解剖崩坏的负面词
-- **补词开关**（默认开）：只在你没写够细节时才追加质量词，写满了就不动，免得稀释意图
-- **实际提示词实时预览**：发出去之前先看你到底发了什么
-- 步数 / 宽 / 高 / CFG / 种子（`-1` 随机，填定值可复现）
-- 一次出多张、缩略图切换、一键存相册（`Pictures/Qwen21/`，走 MediaStore 不需要存储权限）
+1. `hello` 探出 Key 属于哪个账号（不用你填用户名）
+2. `kernels/push` 起或复用你名下的 GPU 会话（内核代码编译进 APK，离线也能推）
+3. 轮询内核日志，等云端把隧道地址和设备令牌写下来（`QWEN21://…` 那一行）
+4. 探活通过后，端上封一个加密信封提交出图
+5. 取回图片，存相册
+
+首次约 10-15 分钟（装 ComfyUI + 拉 17GB INT8 权重），之后每次开 App 秒连；
+云端快到期时会自己 push 新版本续跑，手机不用管。
+
+装好后还能调：风格预设 8 种、NSFW 开关、补词开关、实际提示词预览、
+步数 / 宽高 / CFG / 种子（定值可复现）、一次 1/2/4 张、缩略图切换、存相册（`Pictures/Qwen21/`）。
 
 ### 自己编译
 
@@ -75,6 +93,15 @@ cd android && ./build.sh
 - `DecryptText`：从图里读回码字，逆向还原
 - APK 的 `Crypto.java` 是独立实现，seed 编译进包里，明文不出设备
 
+上一版只把提示词装进密文，步数、尺寸、种子、负面词还是明文 JSON 过网。现在整条指令走一个信封：
+
+```
+CB 22 01 00 | len(2) | Feistel( b"Q2" | n × [klen key vlen type payload] )
+```
+
+云端 `/qwen/generate` 现拆现拼工作流，解密后的提示词只活在进程内存里，
+不打印、不落盘。`/qwen/health`、`/qwen/task/{id}` 只回状态与文件名。
+
 边长取 2 的幂，位反转才是严格双射；码字多时边长自动翻倍。
 
 ![密文图](docs/sample-cipher.png)
@@ -82,3 +109,13 @@ cd android && ./build.sh
 *72 个码字铺在 32×32 里。上面这张就是这次实测的密文图，肉眼读不出内容。*
 
 已做双向交叉验证：Java 码字 → Python 图 → Java 读回，以及反向；中英日韩 + emoji + 换行 + 符号全部字节级一致。
+
+## 已知边界
+
+- **首次要等**：装环境 + 17GB 权重约 10-15 分钟，这不是 APK 能优化的部分。
+- **单次会话上限 12 小时**：到期前云端自己 push 新版本接棒，旧会话优雅退出。
+  重启后要重新下权重（这就是上面说的 /tmp 取舍换来的可靠续跑）。
+- **没在真机 + 真 GPU 上端到端跑过**：本次只验证到
+  ①Java↔Python 信封字节级互验 ②APK 内嵌内核 vs 仓库源码 sha256 一致
+  ③真实 aiohttp 服务上跑通「加密上传 → 解封 → 拼工作流 → 出图 → 取回」
+  ④节点路由单测（鉴权 401 / 排队 / 完成）。推理那一步需要 T4。
