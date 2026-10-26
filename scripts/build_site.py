@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """把 README.md 渲染成 GitHub Pages 静态站，输出到 site/。
 
+site/assets/style.css 是手写源文件，其余都是生成物。
+
     pip install markdown && python3 scripts/build_site.py
 """
 import re
@@ -23,6 +25,7 @@ def main() -> None:
     md = markdown.Markdown(extensions=["tables", "fenced_code", "toc", "attr_list", "sane_lists"])
     body = md.convert(src)
 
+    (SITE / "assets").mkdir(parents=True, exist_ok=True)
     for name in ("docs", "apk"):
         dst = SITE / name
         if dst.exists():
@@ -56,6 +59,8 @@ def main() -> None:
 </body>
 </html>
 """
+    if not (SITE / "assets" / "style.css").exists():
+        raise SystemExit("缺 site/assets/style.css")
     (SITE / "index.html").write_text(page, encoding="utf-8")
     (SITE / ".nojekyll").write_text("", encoding="utf-8")
     (SITE / "404.html").write_text(

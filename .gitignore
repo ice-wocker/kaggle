@@ -10,4 +10,6 @@ __pycache__/
 *.pyc
 
 # GitHub Pages 产物（scripts/build_site.py 生成）
-site/
+site/*
+!site/assets/
+!site/assets/style.css
