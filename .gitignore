@@ -8,3 +8,6 @@ local.properties
 *.idsig
 __pycache__/
 *.pyc
+
+# GitHub Pages 产物（scripts/build_site.py 生成）
+site/
